@@ -1,0 +1,28 @@
+# Python generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables (包含敏感信息)
+.env
+
+# Logs
+logs/
+
+# Dependencies and documentation
+date/
+
+# Test files
+test_cache.py
+test_performance.py
+
+# Documentation files
+AI响应速度优化说明.md
+DEVELOPMENT_GUIDE.md
+项目亮点总结.md

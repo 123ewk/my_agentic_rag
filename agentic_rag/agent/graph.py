@@ -1,0 +1,577 @@
+"""
+LangGraph状态机图构建
+"""
+import re
+from typing import Dict, Any, AsyncIterator
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+import asyncio
+import json
+
+from .state import AgentState
+from ..memory.llm_cache import get_llm_cache
+from .nodes import (
+    intent_classification_node,
+    query_rewrite_node,
+    retrieval_node,
+    parallel_retrieval_node,
+    rerank_node,
+    tool_call_node,
+    generation_node,
+    evaluation_node,
+    reflection_node
+)
+from .edges import (
+    route_after_intent,
+    route_after_rewrite,
+    route_after_evaluation,
+    route_after_reflection,
+    route_after_generation,
+    route_after_tool_call,
+    route_after_rerank
+)
+
+class AgenticRAGGraph:
+    """Agentic RAG状态机"""
+    
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        embeddings,
+        vectorstore,
+        reranker,
+        tools: Dict[str, Any],
+        prompt_template: str,
+        short_term_memory=None,
+        long_term_memory=None
+    ):
+        self.llm = llm
+        self.embeddings = embeddings
+        self.vectorstore = vectorstore
+        self.reranker = reranker
+        self.tools = tools
+        self.prompt_template = prompt_template
+        self.short_term_memory = short_term_memory
+        self.long_term_memory = long_term_memory
+        
+        # 构建图
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph[AgentState]:
+        """构建状态机图"""
+        graph = StateGraph(AgentState)
+        
+
+        # LangGraph 对节点处理函数有一个硬性要求：节点函数只能接收一个参数，也就是 state。
+        # 所以 lambda 就是用来解决这个问题的！这个s就是state。
+
+        # 添加节点
+        graph.add_node("intent_classification", 
+                      lambda s: intent_classification_node(s, self.llm))
+        graph.add_node("query_rewrite", 
+                      lambda s: query_rewrite_node(s, self.llm, self.embeddings))
+        graph.add_node("retrieval", 
+                      lambda s: retrieval_node(s, self.vectorstore))
+        graph.add_node("rerank", 
+                      lambda s: rerank_node(s, self.reranker))
+        graph.add_node("tool_call", 
+                      lambda s: tool_call_node(s, self.llm, self.tools))
+        graph.add_node("generation", 
+                      lambda s: generation_node(s, self.llm, self.prompt_template))
+        graph.add_node("evaluation", 
+                      lambda s: evaluation_node(s, self.llm))
+        graph.add_node("reflection", 
+                      lambda s: reflection_node(s, self.llm))
+        
+        # 设置入口点
+        graph.set_entry_point("intent_classification")
+
+        # 添加边
+        graph.add_conditional_edges(
+            "intent_classification", # 起点节点
+            route_after_intent,      # 路由函数
+            {                        # 路由映射表:  "返回值" -> "目标节点名称"
+                "tool_call": "tool_call", 
+                "query_rewrite": "query_rewrite",
+                "generation": "generation"
+            }
+        )
+
+        graph.add_conditional_edges(
+            "query_rewrite",
+            route_after_rewrite,
+            {
+                "retrieval": "retrieval",
+                "rerank": "rerank"
+            }
+        )
+
+        graph.add_conditional_edges(
+            "rerank",
+            route_after_rerank,
+            {
+                "tool_call": "tool_call",
+                "generation": "generation"
+            }
+        )
+
+        graph.add_conditional_edges(
+            "tool_call",
+            route_after_tool_call,
+            {
+                "generation": "generation"
+            }
+        )
+
+        graph.add_conditional_edges(
+            "generation",
+            route_after_generation,
+            {
+                "evaluation": "evaluation",
+            }
+        )
+        
+        graph.add_conditional_edges(
+            "evaluation",
+            route_after_evaluation,
+            {
+                "reflection": "reflection",
+                "__end__": END
+            }
+        )
+        
+        graph.add_conditional_edges(
+            "reflection",
+            route_after_reflection,
+            {
+                "evaluation": "evaluation",
+                "__end__": END
+            }
+        )
+
+        return graph.compile()
+
+    def invoke(self, question: str, **kwargs) -> Dict[str, Any]:
+        """执行Agent，支持短期记忆和长期记忆"""
+        import asyncio
+        
+        session_id = kwargs.get("session_id")
+        user_id = kwargs.get("user_id")
+        
+        initial_state = {
+            "question": question,
+            "intent": "",
+            "rewritten_queries": [],
+            "current_query_index": 0,
+            "retrieved_docs": [],
+            "reranked_docs": [],
+            "generation": "",
+            "refined_answer": "",
+            "evaluation": {},
+            "needs_reflection": False,
+            "tool_results": {},
+            "tool_calls": [],
+            "memory_context": [],
+            "conversation_history": [],
+            "reflection_count": 0,
+            "error": None,
+            "metadata": kwargs
+        }
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            if self.short_term_memory and session_id:
+                loop.run_until_complete(self._load_short_term_memory(initial_state, session_id))
+            
+            if self.long_term_memory and user_id:
+                loop.run_until_complete(self._search_long_term_memory(initial_state, user_id, question))
+        finally:
+            loop.close()
+        
+        result = self.graph.invoke(initial_state)
+        
+        if self.short_term_memory and session_id:
+            answer = result.get("refined_answer") or result.get("generation", "")
+            loop2 = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop2)
+            try:
+                loop2.run_until_complete(
+                    self.short_term_memory.add_message(
+                        session_id=session_id,
+                        question=question,
+                        answer=answer,
+                        metadata={"intent": result.get("intent")}
+                    )
+                )
+            finally:
+                loop2.close()
+        
+        return result
+    
+    async def _load_short_term_memory(self, state: Dict, session_id: str):
+        """加载短期记忆"""
+        try:
+            messages = await self.short_term_memory.get_message(session_id)
+            history = []
+            for msg in messages:
+                role = "user" if hasattr(msg, "type") and msg.type == "human" else "assistant"
+                history.append({"role": role, "content": msg.content})
+            state["conversation_history"] = history
+            
+            context = await self.short_term_memory.get_context(session_id)
+            state["memory_context"] = context.split("\n") if context else []
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"加载短期记忆失败: {e}")
+    
+    async def _search_long_term_memory(self, state: Dict, user_id: str, query: str):
+        """搜索长期记忆"""
+        try:
+            memories = await self.long_term_memory.search(user_id, query)
+            state["memory_context"] = [m["content"] for m in memories]
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"搜索长期记忆失败: {e}")
+
+    async def stream_invoke(
+        self, 
+        question: str, 
+        session_id: str = None, 
+        user_id: str = None,
+        **kwargs
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        流式执行Agent,支持实时返回生成内容和记忆
+        
+        参数：
+            question: 用户问题
+            session_id: 会话ID
+            user_id: 用户ID
+            **kwargs: 其他参数（use_tools, temperature等）
+        
+        产出：
+            Dict[str, Any]: 流式事件，包含type和content字段
+                - type="status": 状态更新（如"意图识别"、"检索中"等）
+                - type="chunk": 生成的内容块
+                - type="sources": 检索到的文档
+                - type="metrics": 评估指标
+                - type="done": 完成信号
+        """
+        initial_state = {
+            "question": question,
+            "intent": "",
+            "rewritten_queries": [],
+            "current_query_index": 0,
+            "retrieved_docs": [],
+            "reranked_docs": [],
+            "generation": "",
+            "refined_answer": "",
+            "evaluation": {},
+            "needs_reflection": False,
+            "tool_results": {},
+            "tool_calls": [],
+            "memory_context": [],
+            "conversation_history": [],
+            "reflection_count": 0,
+            "error": None,
+            "metadata": kwargs
+        }
+        
+        # 加载短期记忆
+        if self.short_term_memory and session_id:
+            try:
+                messages = await self.short_term_memory.get_message(session_id)
+                history = []
+                for msg in messages:
+                    role = "user" if hasattr(msg, "type") and msg.type == "human" else "assistant"
+                    history.append({"role": role, "content": msg.content})
+                initial_state["conversation_history"] = history
+                
+                context = await self.short_term_memory.get_context(session_id)
+                initial_state["memory_context"] = context.split("\n") if context else []
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"加载短期记忆失败: {e}")
+        
+        # 搜索长期记忆
+        if self.long_term_memory and user_id:
+            try:
+                memories = await self.long_term_memory.search(user_id, question)
+                if memories:
+                    existing_context = initial_state.get("memory_context", [])
+                    initial_state["memory_context"] = existing_context + [m["content"] for m in memories]
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"搜索长期记忆失败: {e}")
+        
+        # 1. 意图分类阶段
+        yield {
+            "type": "status", 
+            "content": "正在分析问题意图...",
+            "data": {"stage": "intent_classification"}
+        }
+        state = intent_classification_node(initial_state, self.llm)
+        initial_state.update(state)
+        
+        # 2. 查询改写阶段
+        yield {
+            "type": "status",
+            "content": "正在改写查询...",
+            "data": {"stage": "query_rewrite"}
+        }
+        state = query_rewrite_node(initial_state, self.llm, self.embeddings)
+        initial_state.update(state)
+        
+        # 3. 检索阶段(使用并行检索优化)
+        yield {
+            "type": "status",
+            "content": "正在检索相关文档...",
+            "data": {"stage": "retrieval"}
+        }
+        state = parallel_retrieval_node(initial_state, self.vectorstore)
+        initial_state.update(state)
+        
+        # 4. 重排阶段
+        yield {
+            "type": "status",
+            "content": "正在优化文档排序...",
+            "data": {"stage": "rerank"}
+        }
+        state = rerank_node(initial_state, self.reranker)
+        initial_state.update(state)
+        
+        # 发送检索到的文档
+        if initial_state.get("reranked_docs"):
+            docs_info = [
+                {
+                    "content": doc.page_content[:200] + "...",
+                    "metadata": doc.metadata,
+                    "score": doc.metadata.get("score")
+                }
+                for doc in initial_state["reranked_docs"][:3]
+            ]
+            yield {
+                "type": "sources",
+                "content": "检索到相关文档",
+                "data": {"documents": docs_info}
+            }
+        
+        # 5. 工具调用阶段（如果需要）
+        use_tools = kwargs.get("use_tools", False)
+        if use_tools and initial_state.get("intent") == "tool_call":
+            yield {
+                "type": "status",
+                "content": "正在调用工具...",
+                "data": {"stage": "tool_call"}
+            }
+            state = tool_call_node(initial_state, self.llm, self.tools)
+            initial_state.update(state)
+        
+        # 6. 生成阶段（流式）
+        yield {
+            "type": "status",
+            "content": "正在生成回答...",
+            "data": {"stage": "generation"}
+        }
+        
+        # 构建上下文（包含记忆）
+        context_parts = []
+        memory_context = initial_state.get("memory_context", [])
+        conversation_history = initial_state.get("conversation_history", [])
+        context_docs = initial_state.get("reranked_docs", [])
+        tool_results = initial_state.get("tool_results", {})
+        
+        if not isinstance(tool_results, dict):
+            tool_results = {}
+        
+        # 添加记忆上下文
+        if memory_context:
+            if isinstance(memory_context, list):
+                memory_text = "\n".join(memory_context)
+            else:
+                memory_text = str(memory_context)
+            context_parts.append(f"【相关记忆】\n{memory_text}")
+        
+        # 添加对话历史
+        if conversation_history:
+            history_lines = []
+            for msg in conversation_history:
+                role = "用户" if msg.get("role") == "user" else "助手"
+                content = msg.get("content", "")
+                history_lines.append(f"{role}: {content}")
+            if history_lines:
+                context_parts.append(f"【对话历史】\n" + "\n".join(history_lines))
+        
+        # 添加检索文档
+        if context_docs:
+            docs_content = "\n\n".join([doc.page_content for doc in context_docs])
+            context_parts.append(f"【检索到的文档】\n{docs_content}")
+        
+        # 添加工具结果
+        if tool_results:
+            tool_context = "\n\n【工具调用结果】\n"
+            for tool_name, result in tool_results.items():
+                tool_context += f"- {tool_name}: {result}\n"
+            context_parts.append(tool_context)
+        
+        context = "\n".join(context_parts) if context_parts else "（无相关上下文）"
+        
+        # 使用流式生成
+        prompt = self.prompt_template.format(context=context, question=question)
+        
+        # 检查缓存(基于问题的哈希,忽略上下文差异)
+        llm_cache = get_llm_cache()
+        import hashlib
+        # 只基于问题生成缓存key,忽略context差异
+        question_hash = hashlib.md5(question.strip().lower().encode()).hexdigest()[:16]
+        cached_response = llm_cache.get(question, question_hash)
+        
+        # 检查是否使用快速路径(缓存命中时跳过LLM调用)
+        use_fast_path = kwargs.get("use_fast_path", False)
+        
+        if cached_response and use_fast_path:
+            # 使用缓存,逐字符流式返回
+            logger.info("使用缓存响应(快速路径)")
+            for i in range(0, len(cached_response), 10):
+                chunk = cached_response[i:i+10]
+                if chunk:
+                    yield {
+                        "type": "chunk",
+                        "content": chunk,
+                        "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
+                    }
+                    await asyncio.sleep(0.01)
+            
+            initial_state["generation"] = cached_response
+            full_response = cached_response
+            
+            # 快速路径:不执行评估,直接返回
+            yield {
+                "type": "done",
+                "content": "回答生成完成(缓存)",
+                "data": {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "cached": True,
+                    "intent": initial_state.get("intent", "multi_hop"),
+                    "reflection_count": 0
+                }
+            }
+            return
+            # 使用缓存,逐字符流式返回
+            logger.info("使用缓存响应")
+            for i in range(0, len(cached_response), 10):
+                chunk = cached_response[i:i+10]
+                if chunk:
+                    yield {
+                        "type": "chunk",
+                        "content": chunk,
+                        "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
+                    }
+                    await asyncio.sleep(0.01)  # 小延迟,让前端有时间处理
+            
+            initial_state["generation"] = cached_response
+            full_response = cached_response
+        else:
+            # 使用流式调用LLM
+            temperature = kwargs.get("temperature", 0.7)
+            self.llm.temperature = temperature
+            
+            full_response = ""
+            buffer = ""  # 优化:使用缓冲区减少处理次数
+            
+            async for chunk in self.llm.astream(prompt):
+                content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                buffer += content
+                
+                # 优化:批量处理,减少处理次数(至少50个字符或遇到结束标签才处理)
+                if len(buffer) < 50 and not content.endswith('</think'):
+                    continue
+                
+                # 流式过滤MiniMax思考标签 - 使用优化的正则表达式
+                content = buffer
+                buffer = ""
+                content = re.sub(r'<think[^>]*>.*?</think\s*>', '', content, flags=re.DOTALL)
+                
+                if not content.strip():
+                    continue
+                
+                full_response += content
+                yield {
+                    "type": "chunk",
+                    "content": content,
+                    "data": {"partial_response": full_response}
+                }
+            
+            # 处理剩余缓冲区
+            if buffer:
+                buffer = re.sub(r'<think[^>]*>.*?</think\s*>', '', buffer, flags=re.DOTALL)
+                if buffer.strip():
+                    full_response += buffer
+                    yield {
+                        "type": "chunk",
+                        "content": buffer,
+                        "data": {"partial_response": full_response}
+                    }
+            
+            # 保存到缓存(使用question_hash)
+            llm_cache.set(question, full_response, question_hash)
+        
+        initial_state["generation"] = full_response
+        
+        # 7. 评估阶段
+        yield {
+            "type": "status",
+            "content": "正在评估回答质量...",
+            "data": {"stage": "evaluation"}
+        }
+        state = evaluation_node(initial_state, self.llm)
+        initial_state.update(state)
+        
+        if initial_state.get("evaluation"):
+            yield {
+                "type": "metrics",
+                "content": "评估完成",
+                "data": initial_state["evaluation"]
+            }
+        
+        # 8. 反思阶段（如果需要）
+        if initial_state.get("needs_reflection", False):
+            max_reflection = kwargs.get("max_reflection_steps", 2)
+            if initial_state.get("reflection_count", 0) < max_reflection:
+                yield {
+                    "type": "status",
+                    "content": "正在进行反思优化...",
+                    "data": {"stage": "reflection"}
+                }
+                state = reflection_node(initial_state, self.llm)
+                initial_state.update(state)
+        
+        # 9. 保存对话到短期记忆
+        if self.short_term_memory and session_id:
+            try:
+                await self.short_term_memory.add_message(
+                    session_id=session_id,
+                    question=question,
+                    answer=initial_state.get("generation", ""),
+                    metadata={"intent": initial_state.get("intent")}
+                )
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"保存对话到短期记忆失败: {e}")
+        
+        # 10. 完成
+        yield {
+            "type": "done",
+            "content": "回答生成完成",
+            "data": {
+                "session_id": session_id,
+                "user_id": user_id,
+                "intent": initial_state.get("intent"),
+                "reflection_count": initial_state.get("reflection_count", 0),
+                "tools_used": list(initial_state.get("tool_results", {}).keys())
+            }
+        }
