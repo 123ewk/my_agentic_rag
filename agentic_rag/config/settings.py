@@ -75,6 +75,21 @@ class Settings(BaseSettings):
     frontend_api_key: str = os.getenv("FRONTEND_API_KEY", "")
     frontend_timeout: int = 60
     
+    # 意图识别缓存配置
+    intent_cache_enabled: bool = True
+    intent_cache_max_size: int = 200
+    intent_cache_ttl: int = 1800  # 30分钟
+    
+    # 生成节点上下文截断配置
+    context_truncation_enabled: bool = True
+    max_context_tokens: int = 8000  # 最大上下文token数
+    max_docs_for_context: int = 5   # 最多使用多少个文档
+
+    # 生成结果缓存配置
+    generation_cache_enabled: bool = True
+    generation_cache_max_size: int = 100
+    generation_cache_ttl: int = 3600  # 1小时
+
     class Config:
         env_file = ".env"
         case_sensitive = False

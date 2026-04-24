@@ -6,7 +6,7 @@ LangGraph节点实现
 import re
 import json
 import concurrent.futures
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -15,6 +15,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from ..config.logger_config import logger
+from ..config.settings import get_settings
 from ..tools.tool_calls import tool_call
 from .state import AgentState
 from ..retrieval.query_rewrite import QueryRewriter
@@ -22,10 +23,30 @@ from ..retrieval.hybrid_search import HybridSearchRetriever
 from ..retrieval.reranker import get_reranker
 from ..tools.search import duckduckgo_search
 from ..evaluation.metrics import evaluate_response
+from ..memory.intent_cache import get_intent_cache
 
-def intent_classification_node(state: AgentState, llm: BaseChatModel) -> AgentState:
-    """意图识别节点"""
+
+def intent_classification_node(
+    state: AgentState,
+    llm: BaseChatModel,
+    intent_cache: Optional[object] = None
+) -> AgentState:
+    """
+    意图识别节点（带缓存优化）
+
+    支持：
+    - 内存LRU缓存：快速访问，减少重复LLM调用
+    - 可选Redis持久化：支持多实例共享缓存
+    """
     question = state["question"]
+    settings = get_settings()
+
+    cached_intent = None
+    if settings.intent_cache_enabled and intent_cache is not None:
+        cached_intent = intent_cache.get(question)
+        if cached_intent:
+            logger.info(f"意图缓存命中: '{cached_intent}' <- {question[:50]}...")
+            return {"intent": cached_intent}
 
     intents = ["factual", "multi_hop", "summary", "reasoning"]
 
@@ -44,16 +65,13 @@ def intent_classification_node(state: AgentState, llm: BaseChatModel) -> AgentSt
         """
     )
 
-    # 直接调用LLM,手动解析JSON,避免JsonOutputParser无法处理思考标签
     chain = intent_prompt | llm
 
     try:
         response = chain.invoke({"question": question})
         raw_text = response.content if hasattr(response, 'content') else str(response)
-        
-        # 清理MiniMax思考标签
+
         cleaned = re.sub(r'<think.*?>.*?</think\s*>', '', raw_text, flags=re.DOTALL)
-        # 提取JSON部分
         json_match = re.search(r'\{[^{}]*"intent"\s*:\s*"[^"]+?"[^{}]*\}', cleaned)
         if json_match:
             result = json.loads(json_match.group())
@@ -64,10 +82,13 @@ def intent_classification_node(state: AgentState, llm: BaseChatModel) -> AgentSt
     except Exception as e:
         logger.warning(f"意图识别解析失败,使用默认意图: {e}")
         intent = "multi_hop"
-    
+
     if intent not in intents:
         intent = "multi_hop"
-    
+
+    if settings.intent_cache_enabled and intent_cache is not None:
+        intent_cache.set(question, intent)
+
     return {"intent": intent}
 
 def query_rewrite_node(state: AgentState, llm, embeddings) -> AgentState:
@@ -186,33 +207,105 @@ def tool_call_node(state: AgentState, llm: BaseChatModel, tools: Dict[str, BaseT
     return tool_call(state, llm, tools)
 
 
+def _estimate_tokens(text: str) -> int:
+    """
+    估算token数量（简单估算：中文约2字符/token，英文约4字符/token）
+
+    参数:
+        text: 输入文本
+
+    返回:
+        估算的token数量
+    """
+    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    other_chars = len(text) - chinese_chars
+    return int(chinese_chars / 2 + other_chars / 4)
+
+
+def _truncate_context(
+    context_parts: List[str],
+    max_tokens: int,
+    max_docs: int
+) -> List[str]:
+    """
+    截断上下文以符合token限制
+
+    参数:
+        context_parts: 上下文部分列表
+        max_tokens: 最大token数
+        max_docs: 最多使用的文档数量
+
+    返回:
+        截断后的上下文列表
+    """
+    result = []
+    total_tokens = 0
+
+    for part in context_parts:
+        part_tokens = _estimate_tokens(part)
+
+        if "[检索到的文档]" in part and max_docs > 0:
+            import re
+            docs_match = re.search(r'【检索到的文档】\n(.*)', part, re.DOTALL)
+            if docs_match:
+                docs_text = docs_match.group(1)
+                doc_blocks = re.split(r'\n\n+', docs_text)
+
+                kept_docs = []
+                kept_docs_tokens = 0
+                for doc in doc_blocks[:max_docs]:
+                    doc_tokens = _estimate_tokens(doc)
+                    if total_tokens + kept_docs_tokens + doc_tokens <= max_tokens:
+                        kept_docs.append(doc)
+                        kept_docs_tokens += doc_tokens
+                    else:
+                        break
+
+                if kept_docs:
+                    part = "【检索到的文档】\n" + "\n\n".join(kept_docs)
+                    part_tokens = kept_docs_tokens
+        else:
+            if total_tokens + part_tokens > max_tokens:
+                continue
+
+        total_tokens += part_tokens
+        result.append(part)
+
+    return result
+
+
 def generation_node(state: AgentState, llm, prompt_template: str) -> AgentState:
-    """生成节点,支持记忆上下文"""
+    """
+    生成节点，支持记忆上下文和上下文截断
+
+    功能：
+    - 支持记忆上下文和对话历史
+    - 上下文截断：避免过长上下文导致LLM输入超限
+    - 按优先级保留：记忆 > 对话历史 > 检索文档
+    """
     question = state["question"]
     context_docs = state.get("reranked_docs", [])
     tool_results = state.get("tool_results", {})
     conversation_history = state.get("conversation_history", [])
     memory_context = state.get("memory_context", [])
-    
+    settings = get_settings()
+
     if not isinstance(tool_results, dict):
         tool_results = {}
-    
+
     if state.get("vectorstore_uninitialized", False):
         generation = f"您好!我目前还没有加载知识库内容,无法基于文档回答您的问题。\n\n请先使用文档上传接口(POST /api/v1/upload)上传您的文档,我会自动建立索引后再为您服务。\n\n上传文档后,我就能基于您的知识库回答问题了!"
         return {"generation": generation}
-    
-    # 构建上下文
+
     context_parts = []
-    
-    # 添加记忆上下文(如果有)
+
     if memory_context:
         if isinstance(memory_context, list):
             memory_text = "\n".join(memory_context)
         else:
             memory_text = str(memory_context)
         context_parts.append(f"【相关记忆】\n{memory_text}")
-    
-    # 添加对话历史(如果有)
+
     if conversation_history:
         history_lines = []
         for msg in conversation_history:
@@ -221,27 +314,31 @@ def generation_node(state: AgentState, llm, prompt_template: str) -> AgentState:
             history_lines.append(f"{role}: {content}")
         if history_lines:
             context_parts.append(f"【对话历史】\n" + "\n".join(history_lines))
-    
-    # 添加检索到的文档
+
     if context_docs:
         docs_content = "\n\n".join([doc.page_content for doc in context_docs])
         context_parts.append(f"【检索到的文档】\n{docs_content}")
-    
-    # 添加工具结果
+
     if tool_results and isinstance(tool_results, dict):
         tool_context = "\n\n【工具调用结果】\n"
         for tool_name, result in tool_results.items():
             tool_context += f"- {tool_name}: {result}\n"
         context_parts.append(tool_context)
-    
+
+    if settings.context_truncation_enabled:
+        context_parts = _truncate_context(
+            context_parts,
+            max_tokens=settings.max_context_tokens,
+            max_docs=settings.max_docs_for_context
+        )
+
     context = "\n".join(context_parts) if context_parts else "(无相关上下文)"
-    
-    # 生成答案
+
     prompt = prompt_template.format(context=context, question=question)
     response = llm.invoke(prompt)
-    
+
     generation = response.content if hasattr(response, 'content') else str(response)
-    
+
     return {"generation": generation}
 
 def evaluation_node(state: AgentState, llm) -> AgentState:

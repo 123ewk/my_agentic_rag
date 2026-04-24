@@ -7,11 +7,15 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
+from loguru import logger
 import asyncio
 import json
+import time
 
 from .state import AgentState
-from ..memory.llm_cache import get_llm_cache
+from ..memory.intent_cache import get_intent_cache
+from ..memory.gen_cache import get_generation_cache
+from ..config.settings import get_settings
 from .nodes import (
     intent_classification_node,
     query_rewrite_node,
@@ -35,7 +39,7 @@ from .edges import (
 
 class AgenticRAGGraph:
     """Agentic RAG状态机"""
-    
+
     def __init__(
         self,
         llm: ChatOpenAI,
@@ -55,8 +59,17 @@ class AgenticRAGGraph:
         self.prompt_template = prompt_template
         self.short_term_memory = short_term_memory
         self.long_term_memory = long_term_memory
-        
-        # 构建图
+
+        settings = get_settings()
+        self.intent_cache = get_intent_cache(
+            max_size=settings.intent_cache_max_size,
+            ttl_seconds=settings.intent_cache_ttl
+        )
+        self.gen_cache = get_generation_cache(
+            max_size=settings.generation_cache_max_size,
+            ttl_seconds=settings.generation_cache_ttl
+        )
+
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph[AgentState]:
@@ -68,8 +81,8 @@ class AgenticRAGGraph:
         # 所以 lambda 就是用来解决这个问题的！这个s就是state。
 
         # 添加节点
-        graph.add_node("intent_classification", 
-                      lambda s: intent_classification_node(s, self.llm))
+        graph.add_node("intent_classification",
+                      lambda s: intent_classification_node(s, self.llm, self.intent_cache))
         graph.add_node("query_rewrite", 
                       lambda s: query_rewrite_node(s, self.llm, self.embeddings))
         graph.add_node("retrieval", 
@@ -237,21 +250,21 @@ class AgenticRAGGraph:
             logger.warning(f"搜索长期记忆失败: {e}")
 
     async def stream_invoke(
-        self, 
-        question: str, 
-        session_id: str = None, 
+        self,
+        question: str,
+        session_id: str = None,
         user_id: str = None,
         **kwargs
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         流式执行Agent,支持实时返回生成内容和记忆
-        
+
         参数：
             question: 用户问题
             session_id: 会话ID
             user_id: 用户ID
             **kwargs: 其他参数（use_tools, temperature等）
-        
+
         产出：
             Dict[str, Any]: 流式事件，包含type和content字段
                 - type="status": 状态更新（如"意图识别"、"检索中"等）
@@ -279,7 +292,7 @@ class AgenticRAGGraph:
             "error": None,
             "metadata": kwargs
         }
-        
+
         # 加载短期记忆
         if self.short_term_memory and session_id:
             try:
@@ -289,11 +302,10 @@ class AgenticRAGGraph:
                     role = "user" if hasattr(msg, "type") and msg.type == "human" else "assistant"
                     history.append({"role": role, "content": msg.content})
                 initial_state["conversation_history"] = history
-                
+
                 context = await self.short_term_memory.get_context(session_id)
                 initial_state["memory_context"] = context.split("\n") if context else []
             except Exception as e:
-                from loguru import logger
                 logger.warning(f"加载短期记忆失败: {e}")
         
         # 搜索长期记忆
@@ -304,27 +316,95 @@ class AgenticRAGGraph:
                     existing_context = initial_state.get("memory_context", [])
                     initial_state["memory_context"] = existing_context + [m["content"] for m in memories]
             except Exception as e:
-                from loguru import logger
                 logger.warning(f"搜索长期记忆失败: {e}")
-        
+
+        # 0. 生成缓存快速路径检查（在意图分类之前，避免不必要的LLM调用）
+        settings = get_settings()
+        if settings.generation_cache_enabled:
+            cached_gen = self.gen_cache.get(question, None)
+            if cached_gen:
+                cached_response = cached_gen.get("response", "")
+                logger.info(f"生成缓存命中（快速路径）: {question[:50]}...")
+
+                for i in range(0, len(cached_response), 10):
+                    chunk = cached_response[i:i+10]
+                    if chunk:
+                        yield {
+                            "type": "chunk",
+                            "content": chunk,
+                            "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
+                        }
+                        await asyncio.sleep(0.01)
+
+                yield {
+                    "type": "done",
+                    "content": "回答生成完成(缓存)",
+                    "data": {
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "cached": True,
+                        "intent": cached_gen.get("intent", "unknown"),
+                        "reflection_count": 0,
+                        "gen_cache_hit": True
+                    }
+                }
+                return
+
         # 1. 意图分类阶段
         yield {
-            "type": "status", 
+            "type": "status",
             "content": "正在分析问题意图...",
             "data": {"stage": "intent_classification"}
         }
-        state = intent_classification_node(initial_state, self.llm)
+        state = intent_classification_node(initial_state, self.llm, self.intent_cache)
         initial_state.update(state)
-        
-        # 2. 查询改写阶段
-        yield {
-            "type": "status",
-            "content": "正在改写查询...",
-            "data": {"stage": "query_rewrite"}
-        }
-        state = query_rewrite_node(initial_state, self.llm, self.embeddings)
-        initial_state.update(state)
-        
+
+        # 1.5 生成缓存检查（基于意图的二次检查）
+        if settings.generation_cache_enabled:
+            cached_gen = self.gen_cache.get(question, initial_state.get("intent"))
+            if cached_gen:
+                cached_response = cached_gen.get("response", "")
+                logger.info(f"生成缓存命中（意图过滤）: {question[:50]}...")
+
+                for i in range(0, len(cached_response), 10):
+                    chunk = cached_response[i:i+10]
+                    if chunk:
+                        yield {
+                            "type": "chunk",
+                            "content": chunk,
+                            "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
+                        }
+                        await asyncio.sleep(0.01)
+
+                yield {
+                    "type": "done",
+                    "content": "回答生成完成(缓存)",
+                    "data": {
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "cached": True,
+                        "intent": initial_state.get("intent"),
+                        "reflection_count": 0,
+                        "gen_cache_hit": True
+                    }
+                }
+                return
+
+        # 2. 查询改写阶段（对于factual类型跳过，因为事实查询不需要复杂改写）
+        intent = initial_state.get("intent", "")
+        if intent == "factual":
+            # factual类型直接使用原始问题作为查询
+            initial_state["rewritten_queries"] = [question]
+            logger.info(f"factual类型问题，跳过查询改写")
+        else:
+            yield {
+                "type": "status",
+                "content": "正在改写查询...",
+                "data": {"stage": "query_rewrite"}
+            }
+            state = query_rewrite_node(initial_state, self.llm, self.embeddings)
+            initial_state.update(state)
+
         # 3. 检索阶段(使用并行检索优化)
         yield {
             "type": "status",
@@ -334,14 +414,19 @@ class AgenticRAGGraph:
         state = parallel_retrieval_node(initial_state, self.vectorstore)
         initial_state.update(state)
         
-        # 4. 重排阶段
-        yield {
-            "type": "status",
-            "content": "正在优化文档排序...",
-            "data": {"stage": "rerank"}
-        }
-        state = rerank_node(initial_state, self.reranker)
-        initial_state.update(state)
+        # 4. 重排阶段（factual类型跳过重排API调用，直接使用检索结果）
+        if intent == "factual":
+            # factual类型直接使用检索结果（按相关性排序即可）
+            initial_state["reranked_docs"] = initial_state.get("retrieved_docs", [])[:3]
+            logger.info(f"factual类型问题，跳过重排")
+        else:
+            yield {
+                "type": "status",
+                "content": "正在优化文档排序...",
+                "data": {"stage": "rerank"}
+            }
+            state = rerank_node(initial_state, self.reranker)
+            initial_state.update(state)
         
         # 发送检索到的文档
         if initial_state.get("reranked_docs"):
@@ -416,110 +501,67 @@ class AgenticRAGGraph:
             for tool_name, result in tool_results.items():
                 tool_context += f"- {tool_name}: {result}\n"
             context_parts.append(tool_context)
-        
+
+        # 上下文截断
+        settings = get_settings()
+        if settings.context_truncation_enabled:
+            from .nodes import _truncate_context, _estimate_tokens
+            context_parts = _truncate_context(
+                context_parts,
+                max_tokens=settings.max_context_tokens,
+                max_docs=settings.max_docs_for_context
+            )
+
         context = "\n".join(context_parts) if context_parts else "（无相关上下文）"
-        
+
         # 使用流式生成
         prompt = self.prompt_template.format(context=context, question=question)
-        
-        # 检查缓存(基于问题的哈希,忽略上下文差异)
-        llm_cache = get_llm_cache()
-        import hashlib
-        # 只基于问题生成缓存key,忽略context差异
-        question_hash = hashlib.md5(question.strip().lower().encode()).hexdigest()[:16]
-        cached_response = llm_cache.get(question, question_hash)
-        
-        # 检查是否使用快速路径(缓存命中时跳过LLM调用)
-        use_fast_path = kwargs.get("use_fast_path", False)
-        
-        if cached_response and use_fast_path:
-            # 使用缓存,逐字符流式返回
-            logger.info("使用缓存响应(快速路径)")
-            for i in range(0, len(cached_response), 10):
-                chunk = cached_response[i:i+10]
-                if chunk:
-                    yield {
-                        "type": "chunk",
-                        "content": chunk,
-                        "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
-                    }
-                    await asyncio.sleep(0.01)
-            
-            initial_state["generation"] = cached_response
-            full_response = cached_response
-            
-            # 快速路径:不执行评估,直接返回
+
+        # 使用流式调用LLM
+        temperature = kwargs.get("temperature", 0.7)
+        self.llm.temperature = temperature
+
+        full_response = ""
+        buffer = ""  # 优化:使用缓冲区减少处理次数
+
+        async for chunk in self.llm.astream(prompt):
+            content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            buffer += content
+
+            if len(buffer) < 50 and not content.endswith('</think'):
+                continue
+
+            content = buffer
+            buffer = ""
+            content = re.sub(r'<think[^>]*>.*?</think\s*>', '', content, flags=re.DOTALL)
+
+            if not content.strip():
+                continue
+
+            full_response += content
             yield {
-                "type": "done",
-                "content": "回答生成完成(缓存)",
-                "data": {
-                    "session_id": session_id,
-                    "user_id": user_id,
-                    "cached": True,
-                    "intent": initial_state.get("intent", "multi_hop"),
-                    "reflection_count": 0
-                }
+                "type": "chunk",
+                "content": content,
+                "data": {"partial_response": full_response}
             }
-            return
-            # 使用缓存,逐字符流式返回
-            logger.info("使用缓存响应")
-            for i in range(0, len(cached_response), 10):
-                chunk = cached_response[i:i+10]
-                if chunk:
-                    yield {
-                        "type": "chunk",
-                        "content": chunk,
-                        "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
-                    }
-                    await asyncio.sleep(0.01)  # 小延迟,让前端有时间处理
-            
-            initial_state["generation"] = cached_response
-            full_response = cached_response
-        else:
-            # 使用流式调用LLM
-            temperature = kwargs.get("temperature", 0.7)
-            self.llm.temperature = temperature
-            
-            full_response = ""
-            buffer = ""  # 优化:使用缓冲区减少处理次数
-            
-            async for chunk in self.llm.astream(prompt):
-                content = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                buffer += content
-                
-                # 优化:批量处理,减少处理次数(至少50个字符或遇到结束标签才处理)
-                if len(buffer) < 50 and not content.endswith('</think'):
-                    continue
-                
-                # 流式过滤MiniMax思考标签 - 使用优化的正则表达式
-                content = buffer
-                buffer = ""
-                content = re.sub(r'<think[^>]*>.*?</think\s*>', '', content, flags=re.DOTALL)
-                
-                if not content.strip():
-                    continue
-                
-                full_response += content
+
+        if buffer:
+            buffer = re.sub(r'<think[^>]*>.*?</think\s*>', '', buffer, flags=re.DOTALL)
+            if buffer.strip():
+                full_response += buffer
                 yield {
                     "type": "chunk",
-                    "content": content,
+                    "content": buffer,
                     "data": {"partial_response": full_response}
                 }
-            
-            # 处理剩余缓冲区
-            if buffer:
-                buffer = re.sub(r'<think[^>]*>.*?</think\s*>', '', buffer, flags=re.DOTALL)
-                if buffer.strip():
-                    full_response += buffer
-                    yield {
-                        "type": "chunk",
-                        "content": buffer,
-                        "data": {"partial_response": full_response}
-                    }
-            
-            # 保存到缓存(使用question_hash)
-            llm_cache.set(question, full_response, question_hash)
-        
+
+        self.gen_cache.set(
+            question,
+            full_response,
+            intent=initial_state.get("intent"),
+            metadata={"cached_at": time.time()}
+        )
+
         initial_state["generation"] = full_response
         
         # 7. 评估阶段
@@ -560,7 +602,6 @@ class AgenticRAGGraph:
                     metadata={"intent": initial_state.get("intent")}
                 )
             except Exception as e:
-                from loguru import logger
                 logger.warning(f"保存对话到短期记忆失败: {e}")
         
         # 10. 完成

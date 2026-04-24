@@ -26,3 +26,20 @@ test_performance.py
 AI响应速度优化说明.md
 DEVELOPMENT_GUIDE.md
 项目亮点总结.md
+
+# Node.js
+node_modules/
+package*.json
+
+# Claude
+.claude/
+
+# Office temp files
+*~$.*
+*~/
+*.docx
+
+# Interview files (本地使用，不提交)
+面试八股文_按权重排序.md
+项目介绍_实习用.md
+create_resume.js
