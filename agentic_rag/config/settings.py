@@ -92,8 +92,12 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
-        case_sensitive = False
-        extra = "ignore"
+        case_sensitive = False # 不区分大小写
+        extra = "ignore" # 忽略额外的配置项
+    
+    #  # 告诉它：去读 .env 文件
+    # model_config = SettingsConfigDict(env_file=".env")
+
 
     def get_model_config(self, model_name: str) -> Dict[str, str]:
         """

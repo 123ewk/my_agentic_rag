@@ -22,7 +22,8 @@ class MilvusClient:
         self, 
         collection_name: str = "table_agentic_rag", # 向量数据库表名
         embedding_model: Any = "embedding-3", # 接受字符串或嵌入模型实例
-        connection_args: Optional[Dict[str, Any]] = None
+        connection_args: Optional[Dict[str, Any]] = None,
+        index_params: Optional[Dict[str, Any]] = None # 索引参数配置
     ):
         self.collection_name = collection_name
 
@@ -45,6 +46,18 @@ class MilvusClient:
             }
         
         self.connection_args = connection_args
+        
+        # 默认使用IVF_FLAT索引
+        if index_params is None:
+            index_params = {
+                "index_type": "IVF_FLAT",
+                "metric_type": "COSINE",
+                "params": {
+                    "nlist": 1024  # 聚类中心数量
+                }
+            }
+        
+        self.index_params = index_params
 
     def _normalize_metadata(self, documents: List[Document]) -> List[Document]:
         """
@@ -132,7 +145,7 @@ class MilvusClient:
         for doc, doc_id in zip(documents, ids):
             doc.metadata["langchain_primaryid"] = doc_id
 
-        logger.info(f"创建向量存储: {self.collection_name}, 文档数: {len(documents)}, 维度: {self.embedding_model.dimension}")
+        logger.info(f"创建向量存储: {self.collection_name}, 文档数: {len(documents)}, 维度: {self.embedding_model.dimension}, 索引类型: {self.index_params.get('index_type', 'AUTO')}")
 
         self.vectorstore = Milvus.from_documents(
             documents=documents,
@@ -140,13 +153,14 @@ class MilvusClient:
             collection_name=self.collection_name, 
             connection_args=self.connection_args,
             drop_old=drop_old,
-            ids=ids
+            ids=ids,
+            index_params=self.index_params
         )
         return self.vectorstore
     
     def from_existing_collection(self) -> Milvus:
         """
-        从已存在的collection加载向量存储
+        从已存在的collection加载向量存储,只建立连接，不做任何数据操作
 
         返回：
             Milvus向量存储实例
@@ -239,7 +253,7 @@ class MilvusClient:
             raise ValueError("向量库未初始化。请先调用 from_documents 方法.")
         
         if search_kwargs is None:
-            search_kwargs = {"k": 5}
+            search_kwargs = {"k": 3}
         
         return self.vectorstore.as_retriever(
             search_type=search_type,
@@ -249,29 +263,59 @@ class MilvusClient:
     def similarity_search(
         self,
         query: str,
-        k: int = 5,
-        filters: Optional[Dict[str, Any]] = None # 过滤条件
+        k: int = 3,
+        filters: Optional[Dict[str, Any]] = None, # 过滤条件
+        nprobe: int = 16 # IVF_FLAT索引的搜索参数：查询的聚类中心数量
     ) -> List[Document]:
-        """相似度搜索,直接检索，返回文档"""
+        """
+        相似度搜索，返回文档
+        
+        参数：
+            query: 查询文本
+            k: 返回结果数量
+            filters: 过滤条件
+            nprobe: IVF_FLAT索引的搜索参数，值越大搜索越精确但速度越慢
+        """
         if not hasattr(self, 'vectorstore'):
             raise ValueError("向量库未初始化。请先调用 from_documents 方法.")
+        
+        search_kwargs = {}
+        if self.index_params.get("index_type") == "IVF_FLAT":
+            search_kwargs["nprobe"] = nprobe
         
         return self.vectorstore.similarity_search(
             query=query,
             k=k,
-            expr=filters
+            expr=filters,
+            **search_kwargs
         )
 
     def similarity_search_with_score(
         self,
         query: str,
-        k: int = 5
+        k: int = 3,
+        nprobe: int = 16 # IVF_FLAT索引的搜索参数
     ) -> List[tuple]:
-        """带分数的相似度搜索,直接检索，返回文档 + 相似度分数"""
+        """
+        带分数的相似度搜索，返回文档 + 相似度分数
+        
+        参数：
+            query: 查询文本
+            k: 返回结果数量
+            nprobe: IVF_FLAT索引的搜索参数
+        """
         if not hasattr(self, 'vectorstore'):
             raise ValueError("向量库未初始化。请先调用 from_documents 方法.")
         
-        return self.vectorstore.similarity_search_with_score(query=query, k=k)
+        search_kwargs = {}
+        if self.index_params.get("index_type") == "IVF_FLAT":
+            search_kwargs["nprobe"] = nprobe
+        
+        return self.vectorstore.similarity_search_with_score(
+            query=query,
+            k=k,
+            **search_kwargs
+        )
     
     def delete_collection(self):
         """删除集合,删除所有文档"""

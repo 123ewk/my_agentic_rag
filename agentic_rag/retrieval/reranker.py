@@ -85,7 +85,7 @@ class BGGReranker(Reranker):
         response.raise_for_status() # 这一行是错误处理：如果 API 返回了 4xx/5xx 等错误状态码（比如鉴权失败、请求格式错误、服务端报错），这行代码会直接抛出异常，方便你定位问题。
         result = response.json()
         # {
-        #     "model": "glm-rerank",
+        #     "model": "rerank",
         #     "results": [
         #         {"index": 0, "relevance_score": 0.98},
         #         {"index": 2, "relevance_score": 0.85},

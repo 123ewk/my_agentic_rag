@@ -48,7 +48,7 @@ class PDFLoader(BaseLoader):
         """
         加载 PDF 文件，返回文档列表
         """
-        pdf_reader = PdfReader(file_path)
+        pdf_reader = PdfReader(file_path) # 读取PDF文件
         documents = []
         for page_num,page in enumerate(pdf_reader.pages):
             text = page.extract_text()
