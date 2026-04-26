@@ -366,15 +366,15 @@ class AgenticRAGGraph:
                 cached_response = cached_gen.get("response", "")
                 logger.info(f"生成缓存命中（快速路径）: {question[:50]}...")
 
-                for i in range(0, len(cached_response), 10):
-                    chunk = cached_response[i:i+10]
+                for i in range(0, len(cached_response), 50):
+                    chunk = cached_response[i:i+50]
                     if chunk:
                         yield {
                             "type": "chunk",
                             "content": chunk,
                             "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
                         }
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(0.05)
 
                 yield {
                     "type": "done",
@@ -406,15 +406,15 @@ class AgenticRAGGraph:
                 cached_response = cached_gen.get("response", "")
                 logger.info(f"生成缓存命中（意图过滤）: {question[:50]}...")
 
-                for i in range(0, len(cached_response), 10):
-                    chunk = cached_response[i:i+10]
+                for i in range(0, len(cached_response), 50):
+                    chunk = cached_response[i:i+50]
                     if chunk:
                         yield {
                             "type": "chunk",
                             "content": chunk,
                             "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
                         }
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(0.05)
 
                 yield {
                     "type": "done",
