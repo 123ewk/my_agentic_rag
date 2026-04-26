@@ -8,6 +8,7 @@ import requests
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Generator
 import json
+import re
 from dotenv import load_dotenv
 
 def get_available_models() -> List[str]:
@@ -235,7 +236,7 @@ class APIClient:
         if self._session:
             self._session.close()
             self._session = None
-    
+
     def upload_documents(self, files, chunk_size=500, chunk_overlap=50):
         url = self._build_url("/api/v1/upload")
         files_data = [("files", (f.name, f.getvalue(), f.type)) for f in files]
@@ -255,6 +256,84 @@ class APIClient:
         if response.status_code >= 400:
             raise ValueError(response.json().get("detail", "未知错误"))
         return response.json()
+
+
+def parse_think_content(text: str) -> tuple:
+    """
+    解析文本中的think标签内容
+
+    参数：
+        text: 包含think标签的原始文本
+
+    返回：
+        tuple: (思考内容列表, 清理后的回复文本)
+    """
+    if not text:
+        return [], ""
+
+    think_content = []
+
+    think_pattern = r'<think\b[^>]*>(.*?)</think\s*>'
+    think_matches = re.finditer(think_pattern, text, re.DOTALL)
+
+    for match in think_matches:
+        content = match.group(1).strip()
+        if content:
+            think_content.append(content)
+
+    cleaned_text = re.sub(think_pattern, '', text, flags=re.DOTALL).strip()
+
+    return think_content, cleaned_text
+
+
+def has_think_content(text: str) -> bool:
+    """
+    检查文本中是否包含think标签
+
+    参数：
+        text: 待检查的文本
+
+    返回：
+        bool: 是否包含think标签
+    """
+    if not text:
+        return False
+    return bool(re.search(r'<think\b[^>]*>.*?</think\s*>', text, re.DOTALL))
+
+
+def render_thinking_section(think_content: List[str]):
+    """
+    渲染思考过程部分（可折叠）
+
+    参数：
+        think_content: 思考内容列表
+    """
+    if not think_content:
+        return
+
+    total_thinks = len(think_content)
+
+    with st.expander(f"🧠 **思考过程** ({total_thinks} 段，点击展开查看)", expanded=False):
+        for i, think in enumerate(think_content, 1):
+            st.markdown(f"**🤔 思考 {i}:**")
+            st.markdown(think)
+            if i < total_thinks:
+                st.markdown("---")
+
+
+def render_thinking_stream(think_buffer: str, think_placeholder):
+    """
+    流式渲染思考内容
+
+    参数：
+        think_buffer: 当前的思考内容缓冲区
+        think_placeholder: Streamlit占位符
+    """
+    if think_buffer:
+        with think_placeholder.container():
+            st.markdown("**🧠 思考中...**")
+            st.info(think_buffer + "▌")
+
 
 def init_session_state():
     """初始化Streamlit会话状态"""
@@ -410,24 +489,35 @@ def render_sidebar() -> Dict[str, Any]:
 def render_message(message: Dict[str, Any]):
     """
     渲染单条聊天消息
-    
+
     参数：
         message: 消息数据字典
     """
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        
+        if message["role"] == "assistant":
+            think_content = message.get("think_content", [])
+            answer = message.get("content", "")
+
+            if think_content:
+                render_thinking_section(think_content)
+                st.markdown("**📝 最终回复:**")
+                st.markdown(answer)
+            else:
+                st.markdown(answer)
+        else:
+            st.markdown(message["content"])
+
         if "sources" in message and message["sources"]:
             with st.expander("📄 查看来源"):
                 for i, source in enumerate(message["sources"], 1):
                     source_name = source.get("source", f"来源 {i}")
                     score = source.get("score")
                     content = source.get("content", "")
-                    
+
                     st.markdown(f"**{source_name}** {f'(相似度: {score:.2f})' if score else ''}")
                     st.text(content[:300] + "..." if len(content) > 300 else content)
                     st.markdown("---")
-        
+
         if "metrics" in message and message["metrics"]:
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -442,7 +532,7 @@ def render_message(message: Dict[str, Any]):
                 )
             with col3:
                 st.metric("反思次数", message.get("reflection_count", 0))
-        
+
         if "processing_time" in message:
             st.caption(f"⏱️ 处理耗时: {message['processing_time']:.2f}秒")
 
@@ -575,15 +665,16 @@ def handle_stream_query(
 ) -> Dict[str, Any]:
     """
     处理流式查询请求
-    
+
     参数：
         prompt: 用户问题
         client: API客户端
         config: 配置参数
-    
+
     返回：
         响应结果
     """
+    thinking_placeholder = st.empty()
     response_placeholder = st.empty()
     full_response = ""
     sources = []
@@ -591,7 +682,10 @@ def handle_stream_query(
     reflection_count = 0
     start_time = time.time()
     error_occurred = False
-    
+
+    think_content = []
+    has_think = False
+
     try:
         for event in client.query_stream(
             question=prompt,
@@ -602,73 +696,131 @@ def handle_stream_query(
             model_name=config.get("model_name")
         ):
             event_type = event.get("type", "")
-            
+
             if event_type == "status":
                 continue
-            
+
             elif event_type == "chunk" or event_type == "token":
                 token = event.get("content", "") or ""
+
                 full_response += token
-                response_placeholder.markdown(full_response + "▌")
-            
+
+                think_pattern = r'<think\b[^>]*>(.*?)</think\s*>'
+                matches = list(re.finditer(think_pattern, full_response, re.DOTALL))
+
+                if matches:
+                    has_think = True
+                    new_thinks = []
+                    for match in matches:
+                        content = match.group(1).strip()
+                        if content and content not in think_content:
+                            new_thinks.append(content)
+
+                    for new_think in new_thinks:
+                        if new_think not in think_content:
+                            think_content.append(new_think)
+
+                    if think_content:
+                        last_think = think_content[-1]
+                        thinking_placeholder.info(f"🧠 **正在思考...** (共 {len(think_content)} 段)\n\n{last_think[:200]}▌")
+                elif has_think:
+                    thinking_placeholder.info(f"🧠 **思考完成** (共 {len(think_content)} 段)")
+                else:
+                    thinking_placeholder.empty()
+
+                cleaned = re.sub(think_pattern, '', full_response, flags=re.DOTALL)
+                response_placeholder.markdown(cleaned + "▌")
+
             elif event_type == "sources":
                 data = event.get("data", {})
                 if isinstance(data, dict) and "documents" in data:
                     for doc in data["documents"]:
                         sources.append(doc)
-            
+
             elif event_type == "source":
                 source_data = event.get("data", {})
                 if isinstance(source_data, dict):
                     sources.append(source_data)
-            
+
             elif event_type == "metrics":
                 metrics_data = event.get("data", {})
                 if isinstance(metrics_data, dict):
                     metrics = metrics_data
-            
+
             elif event_type == "reflection":
                 reflection_count += 1
-            
+
             elif event_type == "done":
-                if not full_response:
+                event_data = event.get("data", {})
+                think_content_from_event = event_data.get("think_content", [])
+                has_think_from_event = event_data.get("has_think", False)
+
+                st.sidebar.info(f"🔍 调试: has_think={has_think_from_event}, think_count={len(think_content_from_event)}")
+
+                if think_content:
+                    with st.sidebar.expander("🔍 提取的思考内容"):
+                        for i, think in enumerate(think_content, 1):
+                            st.text(f"思考 {i}: {think[:100]}...")
+
+                if think_content_from_event:
+                    for new_think in think_content_from_event:
+                        if new_think.strip() and new_think.strip() not in think_content:
+                            think_content.append(new_think.strip())
+                    has_think = True
+
+                if not full_response.strip():
                     full_response = "抱歉，当前无法生成回答，请检查系统状态或稍后重试。"
-                response_placeholder.markdown(full_response)
+                    thinking_placeholder.empty()
+                    response_placeholder.markdown(full_response)
+                else:
+                    thinking_placeholder.empty()
+                    response_placeholder.empty()
+
+                    if has_think and think_content:
+                        render_thinking_section(think_content)
+                        st.markdown("**📝 最终回复:**")
+
+                        cleaned_final = re.sub(r'<think\b[^>]*>.*?</think\s*>', '', full_response, flags=re.DOTALL)
+                        st.markdown(cleaned_final)
+                    else:
+                        st.markdown(full_response)
                 break
-            
+
             elif event_type == "error":
                 error_occurred = True
                 error_msg = event.get("content", "未知错误")
                 st.error(f"服务端错误: {error_msg}")
                 full_response = f"处理失败: {error_msg}"
+                thinking_placeholder.empty()
                 response_placeholder.markdown(full_response)
                 return None
-    
+
     except GeneratorExit:
         pass
     except Exception as e:
         error_occurred = True
         st.error(f"请求处理异常: {str(e)}")
         full_response = f"请求处理异常: {str(e)}"
+        thinking_placeholder.empty()
         response_placeholder.markdown(full_response)
         return None
-    
+
     processing_time = time.time() - start_time
-    
+
     if sources:
         with st.expander("📄 查看来源"):
             for i, source in enumerate(sources, 1):
                 source_name = source.get("source", f"来源 {i}")
                 score = source.get("score")
                 content = source.get("content", "")
-                
+
                 if not isinstance(content, str):
                     content = str(content) if content else ""
-                
+
                 st.markdown(f"**{source_name}** {f'(相似度: {score:.2f})' if score else ''}")
                 st.text(content[:300] + "..." if len(content) > 300 else content)
                 st.markdown("---")
-    
+
     if metrics:
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -677,15 +829,16 @@ def handle_stream_query(
             st.metric("相关性", f"{metrics.get('answer_relevancy', 0):.2f}")
         with col3:
             st.metric("反思次数", reflection_count)
-    
+
     st.caption(f"⏱️ 处理耗时: {processing_time:.2f}秒")
-    
+
     return {
         "answer": full_response,
         "sources": sources,
         "metrics": metrics,
         "reflection_count": reflection_count,
-        "processing_time": processing_time
+        "processing_time": processing_time,
+        "think_content": think_content if has_think else []
     }
 
 
@@ -718,7 +871,7 @@ def main():
             st.markdown(prompt)
         
         result = handle_user_input(prompt, config)
-        
+
         if result:
             st.session_state.messages.append({
                 "role": "assistant",
@@ -727,6 +880,7 @@ def main():
                 "metrics": result.get("metrics", {}),
                 "reflection_count": result.get("reflection_count", 0),
                 "processing_time": result.get("processing_time", 0),
+                "think_content": result.get("think_content", []),
                 "timestamp": datetime.now().isoformat()
             })
 

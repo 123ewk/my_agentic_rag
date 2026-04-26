@@ -18,7 +18,7 @@ from ..config.logger_config import logger
 from ..config.settings import get_settings
 from ..tools.tool_calls import tool_call
 from .state import AgentState
-from ..retrieval.query_rewrite import QueryRewriter
+from ..retrieval.query_rewrite import QueryRewriter, _clean_think_tags
 from ..retrieval.hybrid_search import HybridSearchRetriever
 from ..retrieval.reranker import get_reranker
 from ..tools.search import duckduckgo_search
@@ -71,7 +71,7 @@ def intent_classification_node(
         response = chain.invoke({"question": question})
         raw_text = response.content if hasattr(response, 'content') else str(response)
 
-        cleaned = re.sub(r'<think.*?>.*?</think\s*>', '', raw_text, flags=re.DOTALL)
+        cleaned = _clean_think_tags(raw_text)
         json_match = re.search(r'\{[^{}]*"intent"\s*:\s*"[^"]+?"[^{}]*\}', cleaned)
         if json_match:
             result = json.loads(json_match.group())
@@ -338,6 +338,7 @@ def generation_node(state: AgentState, llm, prompt_template: str) -> AgentState:
     response = llm.invoke(prompt)
 
     generation = response.content if hasattr(response, 'content') else str(response)
+    generation = _clean_think_tags(generation)
 
     return {"generation": generation}
 
@@ -394,6 +395,7 @@ def reflection_node(state: AgentState, llm) -> AgentState:
     
     response = llm.invoke(reflection_prompt)
     refined = response.content if hasattr(response, 'content') else str(response)
+    refined = _clean_think_tags(refined)
     
     return {
         "refined_answer": refined,

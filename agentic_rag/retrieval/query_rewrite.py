@@ -13,8 +13,20 @@ from ..config.logger_config import logger
 
 
 def _clean_think_tags(text: str) -> str:
-    """清理模型输出的思考标签，兼容MiniMax等模型"""
-    return re.sub(r'<think.*?>.*?</think\s*>', '', text, flags=re.DOTALL)
+    """清理模型输出的思考标签，兼容MiniMax等模型
+    
+    支持清理以下格式的思考标签:
+    -<think>...</think> (Claude等)
+    -<think>...</think> (MiniMax等)
+    """
+    if not text:
+        return text
+    
+    cleaned = re.sub(r'<think\b[^>]*>(.*?)</think\s*>', '', text, flags=re.DOTALL)
+    
+    cleaned = re.sub(r'<think\b[^>]*>(.*?)</think\s*>', '', cleaned, flags=re.DOTALL)
+    
+    return cleaned.strip()
 
 
 def _parse_json_from_llm(raw_text: str, key: str) -> List[str]:

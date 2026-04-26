@@ -16,6 +16,7 @@ from .state import AgentState
 from ..memory.intent_cache import get_intent_cache
 from ..memory.gen_cache import get_generation_cache
 from ..config.settings import get_settings
+from ..retrieval.query_rewrite import _clean_think_tags
 from .nodes import (
     intent_classification_node,
     query_rewrite_node,
@@ -553,15 +554,13 @@ class AgenticRAGGraph:
 
         context = "\n".join(context_parts) if context_parts else "（无相关上下文）"
 
-        # 使用流式生成
         prompt = self.prompt_template.format(context=context, question=question)
 
-        # 使用流式调用LLM
         temperature = kwargs.get("temperature", 0.7)
         self.llm.temperature = temperature
 
         full_response = ""
-        buffer = ""  # 优化:使用缓冲区减少处理次数
+        buffer = ""
 
         async for chunk in self.llm.astream(prompt):
             content = chunk.content if hasattr(chunk, 'content') else str(chunk)
@@ -572,36 +571,58 @@ class AgenticRAGGraph:
 
             content = buffer
             buffer = ""
-            content = re.sub(r'<think[^>]*>.*?</think\s*>', '', content, flags=re.DOTALL)
 
             if not content.strip():
                 continue
 
             full_response += content
+
+            think_pattern = r'<think\b[^>]*>.*?</think\s*>'
+            has_think = bool(re.search(think_pattern, full_response, re.DOTALL))
+            cleaned_preview = re.sub(think_pattern, '', content, flags=re.DOTALL) if has_think else content
+
             yield {
                 "type": "chunk",
-                "content": content,
-                "data": {"partial_response": full_response}
+                "content": cleaned_preview,
+                "data": {
+                    "partial_response": full_response,
+                    "has_think": has_think
+                }
             }
 
         if buffer:
-            buffer = re.sub(r'<think[^>]*>.*?</think\s*>', '', buffer, flags=re.DOTALL)
             if buffer.strip():
                 full_response += buffer
+                think_pattern = r'<think\b[^>]*>.*?</think\s*>'
+                has_think = bool(re.search(think_pattern, full_response, re.DOTALL))
+                cleaned_buffer = re.sub(think_pattern, '', buffer, flags=re.DOTALL) if has_think else buffer
+
                 yield {
                     "type": "chunk",
-                    "content": buffer,
-                    "data": {"partial_response": full_response}
+                    "content": cleaned_buffer,
+                    "data": {
+                        "partial_response": full_response,
+                        "has_think": has_think
+                    }
                 }
 
+        think_pattern = r'<think\b[^>]*>(.*?)</think\s*>'
+        think_matches = re.findall(think_pattern, full_response, re.DOTALL)
+        think_content = [match.strip() for match in think_matches if match.strip()]
+
+        logger.info(f"流式生成完成 - has_think: {bool(think_content)}, think_content数量: {len(think_content)}")
+        if think_content:
+            logger.info(f"思考内容预览: {think_content[:2] if think_content else []}")
+
+        cleaned_for_cache = _clean_think_tags(full_response)
         self.gen_cache.set(
             question,
-            full_response,
+            cleaned_for_cache,
             intent=initial_state.get("intent"),
             metadata={"cached_at": time.time()}
         )
 
-        initial_state["generation"] = full_response
+        initial_state["generation"] = cleaned_for_cache
         
         # 7. 评估阶段
         yield {
@@ -671,6 +692,8 @@ class AgenticRAGGraph:
                 "user_id": user_id,
                 "intent": initial_state.get("intent"),
                 "reflection_count": initial_state.get("reflection_count", 0),
-                "tools_used": list(initial_state.get("tool_results", {}).keys())
+                "tools_used": list(initial_state.get("tool_results", {}).keys()),
+                "think_content": think_content,
+                "has_think": bool(think_content)
             }
         }
