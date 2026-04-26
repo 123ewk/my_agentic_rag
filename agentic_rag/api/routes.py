@@ -91,8 +91,9 @@ def create_agent() -> Any:
         dimension=settings.embedding_dimension
     )
     
-    from agentic_rag.vectorstore.milvus_client import MilvusClient
-    vectorstore = MilvusClient(
+    # 使用单例模式获取向量存储，避免频繁创建gRPC连接
+    from agentic_rag.vectorstore.milvus_client import get_vectorstore
+    vectorstore = get_vectorstore(
         collection_name=settings.milvus_collection,
         embedding_model=embeddings,
     )

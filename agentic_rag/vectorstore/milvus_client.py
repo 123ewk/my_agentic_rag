@@ -1,29 +1,36 @@
 """
 Milvus向量数据库客户端
+
+连接管理策略：
+- 采用单例模式而非传统连接池（与PostgreSQL/Redis不同）
+- Milvus使用gRPC长连接，连接建立开销大，更适合维护单个连接
+- LangChain内部已经处理了连接复用
+- 不同collection_name对应不同的MilvusClient实例
 """
 from dotenv import load_dotenv
 import os
-
-load_dotenv()
-
-
+import threading
 from typing import List, Dict, Any, Optional
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_community.vectorstores import Milvus
 
-
+from loguru import logger
 from .embeddings import get_embeddings
 
+
 class MilvusClient:
-    """Milvus向量数据库封装"""
+    """Milvus向量数据库封装（非线程安全，每次创建新实例）"""
+    
+    _instances: Dict[str, 'MilvusClient'] = {}  # 单例缓存（按collection_name）
+    _lock = threading.Lock()
 
     def __init__(
         self, 
-        collection_name: str = "table_agentic_rag", # 向量数据库表名
-        embedding_model: Any = "embedding-3", # 接受字符串或嵌入模型实例
+        collection_name: str = "table_agentic_rag",  # 向量数据库表名
+        embedding_model: Any = "embedding-3",  # 接受字符串或嵌入模型实例
         connection_args: Optional[Dict[str, Any]] = None,
-        index_params: Optional[Dict[str, Any]] = None # 索引参数配置
+        index_params: Optional[Dict[str, Any]] = None  # 索引参数配置
     ):
         self.collection_name = collection_name
 
@@ -58,6 +65,11 @@ class MilvusClient:
             }
         
         self.index_params = index_params
+        self.vectorstore: Optional[Milvus] = None  # LangChain Milvus实例
+        
+        # 连接统计
+        self._search_count = 0
+        self._last_search_time = 0.0
 
     def _normalize_metadata(self, documents: List[Document]) -> List[Document]:
         """
@@ -264,8 +276,8 @@ class MilvusClient:
         self,
         query: str,
         k: int = 3,
-        filters: Optional[Dict[str, Any]] = None, # 过滤条件
-        nprobe: int = 16 # IVF_FLAT索引的搜索参数：查询的聚类中心数量
+        filters: Optional[Dict[str, Any]] = None,  # 过滤条件
+        nprobe: int = 16  # IVF_FLAT索引的搜索参数：查询的聚类中心数量
     ) -> List[Document]:
         """
         相似度搜索，返回文档
@@ -275,20 +287,40 @@ class MilvusClient:
             k: 返回结果数量
             filters: 过滤条件
             nprobe: IVF_FLAT索引的搜索参数，值越大搜索越精确但速度越慢
+            
+        注意：
+            此方法通过LangChain内部复用gRPC连接，无需手动管理连接池
+            连接在首次使用时建立，后续操作自动复用
         """
-        if not hasattr(self, 'vectorstore'):
-            raise ValueError("向量库未初始化。请先调用 from_documents 方法.")
+        if not hasattr(self, 'vectorstore') or self.vectorstore is None:
+            raise ValueError("向量库未初始化。请先调用 from_documents 或 from_existing_collection 方法.")
         
         search_kwargs = {}
         if self.index_params.get("index_type") == "IVF_FLAT":
             search_kwargs["nprobe"] = nprobe
         
-        return self.vectorstore.similarity_search(
+        import time
+        start_time = time.time()
+        
+        results = self.vectorstore.similarity_search(
             query=query,
             k=k,
             expr=filters,
             **search_kwargs
         )
+        
+        # 性能监控
+        self._search_count += 1
+        self._last_search_time = time.time() - start_time
+        
+        logger.debug(
+            f"向量检索完成: collection={self.collection_name}, "
+            f"query长度={len(query)}, k={k}, "
+            f"结果数={len(results)}, 耗时={self._last_search_time:.3f}s, "
+            f"累计检索={self._search_count}次"
+        )
+        
+        return results
 
     def similarity_search_with_score(
         self,
@@ -333,14 +365,79 @@ class MilvusClient:
             "count": self.vectorstore.col().num_entities  # 返回当前集合里的向量总数（也就是你存入的文档片段数量）。
         }
 
+
+    @classmethod
+    def get_instance(
+        cls,
+        collection_name: str = "table_agentic_rag",
+        embedding_model: Any = "embedding-3",
+        connection_args: Optional[Dict[str, Any]] = None,
+        index_params: Optional[Dict[str, Any]] = None
+    ) -> 'MilvusClient':
+        """
+        获取MilvusClient单例实例（线程安全）
+        
+        采用单例模式的原因：
+        - Milvus使用gRPC长连接，频繁创建/销毁连接开销大
+        - 保持单个连接实例，所有检索操作复用同一连接
+        - 不同collection_name对应不同实例
+        
+        Args:
+            collection_name: 向量数据库表名
+            embedding_model: 嵌入模型（字符串或实例）
+            connection_args: 连接参数
+            index_params: 索引参数
+            
+        Returns:
+            MilvusClient单例实例
+        """
+        with cls._lock:
+            # 根据collection_name作为key实现单例
+            if collection_name not in cls._instances:
+                logger.info(f"创建新的MilvusClient实例: collection={collection_name}")
+                cls._instances[collection_name] = cls(
+                    collection_name=collection_name,
+                    embedding_model=embedding_model,
+                    connection_args=connection_args,
+                    index_params=index_params
+                )
+            else:
+                logger.debug(f"复用已存在的MilvusClient实例: collection={collection_name}")
+            
+            return cls._instances[collection_name]
+
+
 def get_vectorstore(
     collection_name: str = "table_agentic_rag",
-    embedding_model: str = "embedding-3",
-    connection_args: Optional[Dict[str, Any]] = None
+    embedding_model: Any = "embedding-3",
+    connection_args: Optional[Dict[str, Any]] = None,
+    index_params: Optional[Dict[str, Any]] = None
 ) -> MilvusClient:
-    """获取向量存储实例"""
-    return MilvusClient(
+    """
+    获取向量存储单例实例（推荐方式）
+    
+    与直接创建MilvusClient不同，此函数保证：
+    - 同一collection_name只创建一个实例
+    - 所有检索操作复用同一gRPC连接
+    - 避免频繁创建/销毁连接的开销
+    
+    Args:
+        collection_name: 向量数据库表名
+        embedding_model: 嵌入模型（字符串或实例）
+        connection_args: 连接参数
+        index_params: 索引参数
+        
+    Returns:
+        MilvusClient单例实例
+        
+    示例:
+        # 推荐用法
+        vectorstore = get_vectorstore("my_collection", embeddings)
+        results = vectorstore.similarity_search("query", k=5)
+    """
+    return MilvusClient.get_instance(
         collection_name=collection_name,
         embedding_model=embedding_model,
-        connection_args=connection_args
+        connection_args=connection_args,
+        index_params=index_params
     )

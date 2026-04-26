@@ -7,7 +7,7 @@ import asyncio
 
 from agentic_rag.config.settings import get_settings
 from agentic_rag.config.logger_config import setup_logging
-from agentic_rag.vectorstore.milvus_client import MilvusClient
+from agentic_rag.vectorstore.milvus_client import get_vectorstore
 from agentic_rag.vectorstore.embeddings import get_embeddings
 from agentic_rag.retrieval.reranker import get_reranker
 from agentic_rag.agent.graph import AgenticRAGGraph
@@ -46,7 +46,8 @@ def initialize_components():
     logger.info(f"嵌入模型: {settings.embedding_model_name}")
     
     # 3. 初始化向量存储(传递embeddings实例而非字符串,确保dimension等参数一致)
-    vectorstore = MilvusClient(
+    # 使用单例模式，避免频繁创建gRPC连接
+    vectorstore = get_vectorstore(
         collection_name=settings.milvus_collection,
         embedding_model=embeddings
     )
