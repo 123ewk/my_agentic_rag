@@ -2,7 +2,7 @@
 LangGraph状态机图构建
 """
 import re
-from typing import Dict, Any, AsyncIterator
+from typing import Dict, Any, AsyncIterator, Optional
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -248,7 +248,46 @@ class AgenticRAGGraph:
         except Exception as e:
             from loguru import logger
             logger.warning(f"搜索长期记忆失败: {e}")
-
+    
+    def _build_memory_content(self, state: Dict, question: str) -> Optional[str]:
+        """
+        构建可用于长期记忆的内容
+        
+        Args:
+            state: Agent状态字典
+            question: 用户问题
+            
+        Returns:
+            格式化后的记忆内容，如果无需保存则返回None
+        """
+        intent = state.get("intent", "")
+        generation = state.get("generation", "")
+        
+        if not generation:
+            return None
+        
+        memory_parts = []
+        memory_parts.append(f"用户问题: {question}")
+        memory_parts.append(f"意图: {intent}")
+        
+        reflection_count = state.get("reflection_count", 0)
+        if reflection_count > 0:
+            memory_parts.append(f"经过{reflection_count}轮反思优化")
+        
+        retrieved_docs = state.get("retrieved_docs", [])
+        if retrieved_docs:
+            doc_sources = [doc.metadata.get("source", "unknown") for doc in retrieved_docs]
+            memory_parts.append(f"参考文档: {', '.join(set(doc_sources))}")
+        
+        tool_results = state.get("tool_results", {})
+        if tool_results:
+            tool_names = list(tool_results.keys())
+            memory_parts.append(f"使用工具: {', '.join(tool_names)}")
+        
+        memory_parts.append(f"最终回答: {generation[:500]}...")
+        
+        return "\n".join(memory_parts)
+    
     async def stream_invoke(
         self,
         question: str,
@@ -603,6 +642,25 @@ class AgenticRAGGraph:
                 )
             except Exception as e:
                 logger.warning(f"保存对话到短期记忆失败: {e}")
+        
+        # 9.5 保存重要内容到长期记忆
+        if self.long_term_memory and user_id:
+            try:
+                memory_content = self._build_memory_content(initial_state, question)
+                if memory_content:
+                    await self.long_term_memory.save_memory(
+                        user_id=user_id,
+                        content=memory_content,
+                        session_id=session_id,
+                        metadata={
+                            "intent": initial_state.get("intent"),
+                            "reflection_count": initial_state.get("reflection_count", 0),
+                            "tools_used": list(initial_state.get("tool_results", {}).keys())
+                        }
+                    )
+                    logger.info(f"已保存对话到长期记忆 (user_id: {user_id})")
+            except Exception as e:
+                logger.warning(f"保存对话到长期记忆失败: {e}")
         
         # 10. 完成
         yield {

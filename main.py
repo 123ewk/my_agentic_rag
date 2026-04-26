@@ -17,7 +17,8 @@ from agentic_rag.api.routes import create_app
 from agentic_rag.api.db_init import init_memory_tables_sync
 from agentic_rag.memory.short_term import ShortTermMemory
 from agentic_rag.memory.long_term import LongTermMemory
-from agentic_rag.schedulers.short_scheduler import get_scheduler
+from agentic_rag.schedulers.short_scheduler import get_scheduler as get_short_scheduler
+from agentic_rag.schedulers.long_scheduler import get_scheduler as get_long_scheduler
 
 # 加载环境变量
 load_dotenv()
@@ -143,18 +144,58 @@ def initialize_components():
         "long_term_memory": long_term_memory
     }
 
-def setup_scheduler(short_term_memory):
+def setup_short_term_scheduler(short_term_memory):
     """
-    配置定时任务调度器
+    配置短期记忆定时任务调度器
     
     Args:
         short_term_memory: ShortTermMemory实例
     """
-    scheduler = get_scheduler()
+    scheduler = get_short_scheduler()
     scheduler.add_cleanup_expired_task(short_term_memory)
     scheduler.start()
-    logger.info("定时任务调度器配置完成")
+    logger.info("短期记忆定时任务调度器配置完成")
     return scheduler
+
+
+def setup_long_term_scheduler(long_term_memory, user_ids: list = None, retention_days: int = 90):
+    """
+    配置长期记忆定时任务调度器
+    
+    Args:
+        long_term_memory: LongTermMemory实例
+        user_ids: 需要清理的用户ID列表（None表示从数据库动态获取）
+        retention_days: 记忆保留天数，默认90天
+    """
+    scheduler = get_long_scheduler()
+    scheduler.add_cleanup_old_memories_task(long_term_memory, user_ids, retention_days)
+    scheduler.start()
+    logger.info("长期记忆定时任务调度器配置完成")
+    return scheduler
+
+
+def get_all_user_ids(long_term_memory) -> list:
+    """
+    从长期记忆数据库中获取所有活跃用户ID
+    
+    Args:
+        long_term_memory: LongTermMemory实例
+        
+    Returns:
+        用户ID列表
+    """
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            stats = loop.run_until_complete(long_term_memory.get_stats(""))
+            logger.info(f"获取到 {len(stats)} 个用户的长期记忆统计")
+            return list(stats.keys())
+        finally:
+            loop.close()
+    except Exception as e:
+        logger.warning(f"获取用户列表失败: {e}")
+        return []
 
 def main():
     """主函数"""
@@ -165,8 +206,11 @@ def main():
     # 初始化组件
     components = initialize_components()
     
-    # 配置定时任务调度器
-    scheduler = setup_scheduler(components["short_term_memory"])
+    # 配置短期记忆定时任务调度器
+    short_term_scheduler = setup_short_term_scheduler(components["short_term_memory"])
+    
+    # 配置长期记忆定时任务调度器
+    long_term_scheduler = setup_long_term_scheduler(components["long_term_memory"])
     
     # 创建API应用
     app = create_app()

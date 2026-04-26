@@ -311,7 +311,24 @@ class LongTermMemory:
                     "latest_memory_at": latest
                 }
         except Exception as e:
-            logger.error("❌ 获取长期记忆统计失败:{}", str(e))
+            logger.error("❌ 获取长期记忆统计失败: {}", str(e))
+            raise
+    
+    async def get_all_user_ids(self) -> List[str]:
+        """
+        获取所有有记忆的用户ID列表
+        
+        Returns:
+            用户ID列表
+        """
+        try:
+            async with self.async_session() as session:
+                stmt = select(long_term_memories.c.user_id).distinct()
+                result = await session.execute(stmt)
+                user_ids = [row[0] for row in result.fetchall()]
+                return user_ids
+        except Exception as e:
+            logger.error("❌ 获取用户ID列表失败: {}", str(e))
             raise
     
     async def close(self):
@@ -322,4 +339,74 @@ class LongTermMemory:
             logger.info("✅ 数据库连接已关闭")
         except Exception as e:
             logger.error(f"关闭数据库连接时出错: {e}")
+    
+    async def cleanup_old_memories(self, user_id: str, retention_days: int = 90) -> int:
+        """
+        清理指定用户的旧记忆（超过保留天数的记忆）
+        
+        Args:
+            user_id: 用户标识
+            retention_days: 记忆保留天数，默认90天
+            
+        Returns:
+            删除的记忆数量
+        """
+        try:
+            async with self.async_session() as session:
+                # 删除超过保留天数的记忆
+                delete_date = f"now() - interval '{retention_days} days'"
+                stmt = text(f"""
+                    DELETE FROM long_term_memories
+                    WHERE user_id = :user_id
+                        AND created_at < {delete_date}
+                """)
+                result = await session.execute(stmt, {"user_id": user_id})
+                await session.commit()
+                
+                deleted_count = result.rowcount
+                logger.info(f"用户 {user_id} 清理了 {deleted_count} 条超过 {retention_days} 天的旧记忆")
+                return deleted_count
+        except Exception as e:
+            logger.error(f"❌ 清理旧长期记忆失败: {e}")
+            raise
+    
+    async def cleanup_duplicates(self, user_id: str, similarity_threshold: float = 0.95) -> int:
+        """
+        清理指定用户的重复记忆（高相似度记忆只保留最早一条）
+        
+        Args:
+            user_id: 用户标识
+            similarity_threshold: 相似度阈值，超过此值认为重复（默认0.95）
+            
+        Returns:
+            删除的重复记忆数量
+        """
+        try:
+            async with self.async_session() as session:
+                # 查找并删除重复记忆（保留最早的一条）
+                stmt = text("""
+                    DELETE FROM long_term_memories
+                    WHERE id IN (
+                        SELECT DISTINCT ltm1.id
+                        FROM long_term_memories ltm1
+                        JOIN long_term_memories ltm2 
+                            ON ltm1.user_id = ltm2.user_id
+                            AND ltm1.id > ltm2.id
+                            AND ltm1.content = ltm2.content
+                            AND 1 - (ltm1.embedding <=> ltm2.embedding) >= :threshold
+                        WHERE ltm1.user_id = :user_id
+                    )
+                """)
+                result = await session.execute(stmt, {
+                    "user_id": user_id,
+                    "threshold": similarity_threshold
+                })
+                await session.commit()
+                
+                deleted_count = result.rowcount
+                logger.info(f"用户 {user_id} 清理了 {deleted_count} 条重复记忆")
+                return deleted_count
+        except Exception as e:
+            logger.error(f"❌ 清理重复记忆失败: {e}")
+            raise
            
