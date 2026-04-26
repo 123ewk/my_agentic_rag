@@ -17,6 +17,7 @@ from agentic_rag.api.routes import create_app
 from agentic_rag.api.db_init import init_memory_tables_sync
 from agentic_rag.memory.short_term import ShortTermMemory
 from agentic_rag.memory.long_term import LongTermMemory
+from agentic_rag.schedulers.short_scheduler import get_scheduler
 
 # 加载环境变量
 load_dotenv()
@@ -142,6 +143,19 @@ def initialize_components():
         "long_term_memory": long_term_memory
     }
 
+def setup_scheduler(short_term_memory):
+    """
+    配置定时任务调度器
+    
+    Args:
+        short_term_memory: ShortTermMemory实例
+    """
+    scheduler = get_scheduler()
+    scheduler.add_cleanup_expired_task(short_term_memory)
+    scheduler.start()
+    logger.info("定时任务调度器配置完成")
+    return scheduler
+
 def main():
     """主函数"""
     logger.info("=" * 50)
@@ -150,6 +164,9 @@ def main():
     
     # 初始化组件
     components = initialize_components()
+    
+    # 配置定时任务调度器
+    scheduler = setup_scheduler(components["short_term_memory"])
     
     # 创建API应用
     app = create_app()

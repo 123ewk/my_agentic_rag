@@ -98,7 +98,7 @@ class ShortTermMemory:
             logger.error("❌ 数据库连接失败，即将重试：{}", str(e))
             raise  # 抛出让 tenacity 重试
         except Exception as e:
-            logger.error("❌ 未知错误：{}", str(e))
+            logger.error("❌ 短期记忆,数据库连接未知错误：{}", str(e))
             raise
     
     async def add_message(
