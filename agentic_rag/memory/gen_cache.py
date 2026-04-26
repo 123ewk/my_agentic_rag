@@ -32,6 +32,8 @@ class GenerationCache:
             ttl_seconds: 缓存过期时间（秒）
             redis_cache: Redis缓存实例（可选）
             redis_enabled: 是否启用Redis持久化（默认关闭）
+            hits: 缓存命中次数（默认0）
+            misses: 缓存未命中次数（默认0）
         """
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds

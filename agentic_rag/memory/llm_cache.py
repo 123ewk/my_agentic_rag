@@ -30,7 +30,7 @@ class LLMCache:
         self.ttl_seconds = ttl_seconds
         self._cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._timestamps: Dict[str, float] = {}
-        self._lock = threading.RLock()
+        self._lock = threading.RLock() # 可重入锁,是 threading.Lock 的增强版，专门解决递归 / 嵌套场景下的死锁问题
     
     def _generate_key(self, question: str, context_hash: Optional[str] = None) -> str:
         """
@@ -47,7 +47,7 @@ class LLMCache:
         if context_hash:
             content += f"|{context_hash}"
         
-        return hashlib.sha256(content.encode('utf-8')).hexdigest()[:32]
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()[:32] # 取前32位字符作为缓存键
     
     def get(self, question: str, context_hash: Optional[str] = None) -> Optional[str]:
         """
@@ -93,7 +93,7 @@ class LLMCache:
         with self._lock:
             # 如果缓存已满,删除最旧的项
             if len(self._cache) >= self.max_size and key not in self._cache:
-                oldest_key = next(iter(self._cache))
+                oldest_key = next(iter(self._cache)) # 它就是取出有序字典里的【第一个元素】,把有序字典 _cache 变成一个迭代器,取迭代器的第一个元素
                 del self._cache[oldest_key]
                 del self._timestamps[oldest_key]
             

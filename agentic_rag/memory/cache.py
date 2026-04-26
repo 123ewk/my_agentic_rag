@@ -194,7 +194,7 @@ class RedisCache:
         # 将参数排序后生成哈希
         sorted_params = sorted(kwargs.items())
         params_str = json.dumps(sorted_params, ensure_ascii=False)
-        params_hash = hashlib.md5(params_str.encode()).hexdigest()
+        params_hash = hashlib.md5(params_str.encode()).hexdigest() 
         return f"{prefix}:{params_hash}"
 
 
@@ -353,10 +353,10 @@ class RedisRateLimiter:
         window_start = now - window_seconds
         key = f"rate_limit:{client_id}"
         
-        # 清理过期记录
+        # 清理过期记录,删除所有分数 ≤ window_start 的元素
         await self.redis.redis_client.zremrangebyscore(key, 0, window_start)
         
-        # 获取当前计数
+        # 获取当前计数,作用是获取集合的元素总数。
         current = await self.redis.redis_client.zcard(key)
         remaining = max_requests - current
         
