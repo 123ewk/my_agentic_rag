@@ -2,12 +2,16 @@
 
 ## 📖 项目简介
 
-Agentic RAG 是一个基于 LangChain 的智能知识库问答系统，支持：
+Agentic RAG 是一个基于 LangChain/LangGraph 的智能知识库问答系统，支持：
+
 - **多格式文档处理**：PDF、Word、Excel、CSV、Markdown、TXT、网页等
 - **向量检索**：基于 Milvus 的向量数据库存储与检索
 - **Agent 智能问答**：支持反思、多轮对话、工具调用（DuckDuckGo 搜索、计算器）
 - **语义重排**：BGE 重排模型优化检索结果
 - **流式响应**：支持 SSE 流式输出
+- **长短记忆**：短期记忆（PostgreSQL）+ 长期记忆（PostgreSQL + pgvector）
+- **多级缓存**：意图缓存、生成缓存、LLM 调用缓存
+- **定时任务**：短期记忆过期清理、长期记忆自动归档
 
 ---
 
@@ -39,6 +43,9 @@ MILVUS_PORT=19530
 MILVUS_USER=root
 MILVUS_PASSWORD=milvus
 
+# ========== 数据库配置 ==========
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/postgres
+
 # ========== 应用配置 ==========
 API_PORT=8000
 
@@ -52,9 +59,11 @@ API_KEY=your_api_key_here
 uv sync
 ```
 
-### 4. 启动 Milvus 向量数据库
+### 4. 启动依赖服务
 
-确保 Milvus 服务已启动（默认端口 19530）。
+确保以下服务已启动：
+- **Milvus**：向量数据库（默认端口 19530）
+- **PostgreSQL**：记忆存储（默认端口 5433）
 
 ---
 
@@ -290,21 +299,22 @@ tail -f app.log
 
 ```
 agentic_rag/
-├── agent/              # Agent 核心（状态、节点、边、图）
-├── api/                # API 接口（FastAPI 路由、数据模型）
-├── config/             # 配置（设置、日志）
-├── db_sql/             # 数据库 SQL 脚本
-├── document_processing/ # 文档处理（加载器、分块器）
-├── evaluation/         # 评估指标
-├── lock/               # 分布式锁（Redis、PostgreSQL）
-├── memory/             # 记忆系统（短期、长期、缓存）
-├── models/             # 模型封装
-├── retrieval/          # 检索（混合搜索、重排、查询改写）
-├── tools/              # 工具（DuckDuckGo搜索、计算器）
-├── ui/                 # Streamlit 前端
-├── vectorstore/        # 向量存储（Milvus、嵌入模型）
-├── main.py             # 主程序入口
-└── .env                # 环境变量配置
+├── agent/                  # Agent 核心（状态、节点、边、图）
+├── api/                    # API 接口（FastAPI 路由、数据模型）
+├── config/                 # 配置（设置、日志）
+├── db_sql/                 # 数据库 SQL 脚本
+├── document_processing/    # 文档处理（加载器、分块器）
+├── evaluation/             # 评估指标
+├── lock/                   # 分布式锁（Redis、PostgreSQL）
+├── memory/                 # 记忆系统（短期、长期、缓存）
+├── models/                 # 模型封装
+├── retrieval/              # 检索（混合搜索、重排、查询改写）
+├── schedulers/             # 定时任务调度器（短期/长期记忆清理）
+├── tools/                  # 工具（DuckDuckGo搜索、计算器）
+├── ui/                     # Streamlit 前端
+├── vectorstore/            # 向量存储（Milvus、嵌入模型）
+├── main.py                 # 主程序入口
+└── .env                    # 环境变量配置
 ```
 
 ---
