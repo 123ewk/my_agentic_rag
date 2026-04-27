@@ -79,9 +79,9 @@ def run_tests(
     
     print("=" * 70)
     if success:
-        print("✅ 所有测试通过!")
+        print("[PASS] All tests passed!")
     else:
-        print("❌ 部分测试失败")
+        print("[FAIL] Some tests failed")
     print("=" * 70)
     
     return success
