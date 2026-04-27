@@ -17,8 +17,7 @@ from agentic_rag.api.routes import create_app
 from agentic_rag.api.db_init import init_memory_tables_sync
 from agentic_rag.memory.short_term import ShortTermMemory
 from agentic_rag.memory.long_term import LongTermMemory
-from agentic_rag.schedulers.short_scheduler import get_scheduler as get_short_scheduler
-from agentic_rag.schedulers.long_scheduler import get_scheduler as get_long_scheduler
+from agentic_rag.schedulers.long_scheduler import get_scheduler as get_scheduler
 
 # 加载环境变量
 load_dotenv()
@@ -152,7 +151,7 @@ def setup_short_term_scheduler(short_term_memory):
     Args:
         short_term_memory: ShortTermMemory实例
     """
-    scheduler = get_short_scheduler()
+    scheduler = get_scheduler()
     scheduler.add_cleanup_expired_task(short_term_memory)
     scheduler.start()
     logger.info("短期记忆定时任务调度器配置完成")
@@ -168,7 +167,7 @@ def setup_long_term_scheduler(long_term_memory, user_ids: list = None, retention
         user_ids: 需要清理的用户ID列表（None表示从数据库动态获取）
         retention_days: 记忆保留天数，默认90天
     """
-    scheduler = get_long_scheduler()
+    scheduler = get_scheduler()
     scheduler.add_cleanup_old_memories_task(long_term_memory, user_ids, retention_days)
     scheduler.start()
     logger.info("长期记忆定时任务调度器配置完成")
