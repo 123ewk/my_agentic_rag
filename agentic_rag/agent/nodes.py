@@ -72,10 +72,11 @@ def intent_classification_node(
         raw_text = response.content if hasattr(response, 'content') else str(response)
 
         cleaned = _clean_think_tags(raw_text)
+        # 提取JSON里的"intent"键对应的字符串值
         json_match = re.search(r'\{[^{}]*"intent"\s*:\s*"[^"]+?"[^{}]*\}', cleaned)
         if json_match:
-            result = json.loads(json_match.group())
-            intent = result.get("intent", "multi_hop")
+            result = json.loads(json_match.group()) # .group() 方法返回匹配的字符串,.loads() 方法将字符串转换为Python对象
+            intent = result.get("intent", "multi_hop") # 从Python对象中获取"intent"键对应的值,如果不存在则返回"multi_hop"
         else:
             logger.warning(f"意图识别未找到有效JSON,原始输出: {raw_text[:200]}")
             intent = "multi_hop"
@@ -246,9 +247,11 @@ def _truncate_context(
 
         if "[检索到的文档]" in part and max_docs > 0:
             import re
+            # 提取检索到的文档
+            # 匹配【检索到的文档】\n后面的所有内容，直到遇到\n\n或字符串结束,re.DOTALL: 匹配换行符,作用是让 . 可以匹配任意字符，包括换行符 \n
             docs_match = re.search(r'【检索到的文档】\n(.*)', part, re.DOTALL)
             if docs_match:
-                docs_text = docs_match.group(1)
+                docs_text = docs_match.group(1) # .group(1) 表示取出正则表达式中第 1 个捕获组（也就是 (.*) 匹配到的内容）
                 doc_blocks = re.split(r'\n\n+', docs_text)
 
                 kept_docs = []

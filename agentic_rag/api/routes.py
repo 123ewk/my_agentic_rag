@@ -30,6 +30,7 @@ class DateTimeEncoder(json.JSONEncoder):
     """自定义JSON编码器，处理datetime等特殊类型"""
     def default(self, obj):
         if isinstance(obj, datetime):
+            # 转换为ISO格式，如：2023-12-25T12:00:00.000Z
             return obj.isoformat()
         return super().default(obj)
 
@@ -129,6 +130,7 @@ def create_agent() -> Any:
             )
             import asyncio
             try:
+                # 作用是获取当前正在运行的事件循环（event loop）对象。只能在已有事件循环正在运行的异步环境里调用
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 loop = asyncio.new_event_loop()
@@ -137,8 +139,8 @@ def create_agent() -> Any:
             async def init_short_term():
                 await short_term_memory.connect()
             
-            if loop.is_running():
-                import nest_asyncio
+            if loop.is_running(): # 说明当前已经有一个事件循环正在跑了
+                import nest_asyncio # 作用是允许在已经运行的事件循环里，再嵌套运行新的协程（也就是 “嵌套异步”）。
                 nest_asyncio.apply()
                 loop.run_until_complete(init_short_term())
             else:
@@ -675,7 +677,7 @@ async def generate_stream_response(
         use_fast_path: 快速路径模式(缓存命中时跳过评估)
     
     产出：
-        bytes: SSE格式的响应数据
+        bytes: SSE格式的响应数据:SSE 是一种让服务器能主动向浏览器 / 客户端持续推送数据的技术
     """
     try:
         # 如果指定了模型名称，动态更新 agent 的 LLM

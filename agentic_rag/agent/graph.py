@@ -164,7 +164,7 @@ class AgenticRAGGraph:
                 "__end__": END
             }
         )
-
+        # 编译图
         return graph.compile()
 
     def invoke(self, question: str, **kwargs) -> Dict[str, Any]:
@@ -194,12 +194,13 @@ class AgenticRAGGraph:
             "metadata": kwargs
         }
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = asyncio.new_event_loop() # 创建一个全新的、独立的 asyncio 事件循环对象。
+        asyncio.set_event_loop(loop) # 把刚创建的 loop 设置为当前线程的默认事件循环。
         try:
+            # 同步代码会暂停，等异步的短期记忆加载完成，才继续往下走。
             if self.short_term_memory and session_id:
                 loop.run_until_complete(self._load_short_term_memory(initial_state, session_id))
-            
+            # 同步代码会暂停，等异步的长期记忆搜索完成，才继续往下走。
             if self.long_term_memory and user_id:
                 loop.run_until_complete(self._search_long_term_memory(initial_state, user_id, question))
         finally:
@@ -374,6 +375,7 @@ class AgenticRAGGraph:
                             "content": chunk,
                             "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
                         }
+                        # 模拟LLM生成时间
                         await asyncio.sleep(0.05)
 
                 yield {
