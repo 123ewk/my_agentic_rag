@@ -4,6 +4,9 @@ Agentic RAG主程序
 from pathlib import Path
 from dotenv import load_dotenv
 import asyncio
+import signal
+import sys
+import atexit
 
 from agentic_rag.config.settings import get_settings
 from agentic_rag.config.logger_config import setup_logging
@@ -197,6 +200,87 @@ def get_all_user_ids(long_term_memory) -> list:
         logger.warning(f"获取用户列表失败: {e}")
         return []
 
+
+def graceful_shutdown(short_term_scheduler, long_term_scheduler, short_term_memory, long_term_memory):
+    """
+    优雅关闭所有调度器和资源
+    
+    Args:
+        short_term_scheduler: 短期记忆调度器实例
+        long_term_scheduler: 长期记忆调度器实例
+        short_term_memory: 短期记忆管理器实例
+        long_term_memory: 长期记忆管理器实例
+    """
+    logger.info("=" * 50)
+    logger.info("开始优雅关闭系统...")
+    
+    try:
+        # 1. 停止调度器
+        logger.info("正在停止定时任务调度器...")
+        if short_term_scheduler:
+            short_term_scheduler.shutdown()
+            logger.info("短期记忆调度器已停止")
+        
+        if long_term_scheduler:
+            long_term_scheduler.shutdown()
+            logger.info("长期记忆调度器已停止")
+        
+        # 2. 关闭数据库连接
+        logger.info("正在关闭数据库连接...")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            if short_term_memory:
+                loop.run_until_complete(short_term_memory.close())
+                logger.info("短期记忆数据库连接已关闭")
+            
+            if long_term_memory:
+                loop.run_until_complete(long_term_memory.close())
+                logger.info("长期记忆数据库连接已关闭")
+        finally:
+            loop.close()
+        
+        logger.info("系统优雅关闭完成")
+        logger.info("=" * 50)
+    except Exception as e:
+        logger.error(f"优雅关闭时发生错误: {e}")
+
+
+def register_shutdown_handlers(short_term_scheduler, long_term_scheduler, short_term_memory, long_term_memory):
+    """
+    注册系统关闭信号处理器
+    
+    Args:
+        short_term_scheduler: 短期记忆调度器实例
+        long_term_scheduler: 长期记忆调度器实例
+        short_term_memory: 短期记忆管理器实例
+        long_term_memory: 长期记忆管理器实例
+    """
+    def signal_handler(signum, frame):
+        """处理系统信号"""
+        signal_name = signal.Signals(signum).name
+        logger.info(f"接收到系统信号: {signal_name} (信号编号: {signum})")
+        graceful_shutdown(short_term_scheduler, long_term_scheduler, short_term_memory, long_term_memory)
+        sys.exit(0)
+    
+    # 注册 SIGTERM 信号处理器（kill 命令默认发送）
+    signal.signal(signal.SIGTERM, signal_handler)
+    logger.info("已注册 SIGTERM 信号处理器")
+    
+    # 注册 SIGINT 信号处理器（Ctrl+C）
+    signal.signal(signal.SIGINT, signal_handler)
+    logger.info("已注册 SIGINT 信号处理器")
+    
+    # 注册 atexit 处理器（确保程序正常退出时也能清理资源）
+    atexit.register(
+        graceful_shutdown,
+        short_term_scheduler,
+        long_term_scheduler,
+        short_term_memory,
+        long_term_memory
+    )
+    logger.info("已注册 atexit 退出处理器")
+
 def main():
     """主函数"""
     logger.info("=" * 50)
@@ -211,6 +295,14 @@ def main():
     
     # 配置长期记忆定时任务调度器
     long_term_scheduler = setup_long_term_scheduler(components["long_term_memory"])
+    
+    # 注册优雅关闭处理器（信号处理 + atexit）
+    register_shutdown_handlers(
+        short_term_scheduler,
+        long_term_scheduler,
+        components["short_term_memory"],
+        components["long_term_memory"]
+    )
     
     # 创建API应用
     app = create_app()
