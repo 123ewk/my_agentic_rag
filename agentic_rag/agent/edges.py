@@ -10,10 +10,14 @@ def route_after_intent(state: AgentState) -> Literal["tool_call", "query_rewrite
     """意图识别后的路由"""
     intent = state.get("intent", "factual")
     
-    if intent == "multi_hop" or intent == "reasoning":
+    if intent == "tool_call":
+        return "tool_call"
+    elif intent == "multi_hop" or intent == "reasoning":
         return "query_rewrite"
     elif intent == "summary":
         return "generation"
+    elif intent == "factual":
+        return "query_rewrite"
     else:
         return "tool_call"
 

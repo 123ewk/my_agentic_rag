@@ -48,15 +48,16 @@ def intent_classification_node(
             logger.info(f"意图缓存命中: '{cached_intent}' <- {question[:50]}...")
             return {"intent": cached_intent}
 
-    intents = ["factual", "multi_hop", "summary", "reasoning"]
+    intents = ["factual", "multi_hop", "summary", "reasoning", "tool_call"]
 
     intent_prompt = ChatPromptTemplate.from_template("""
-        你是一个用户意图分类助手,需要根据用户的问题,将其归类为以下4种类型之一:
+        你是一个用户意图分类助手,需要根据用户的问题,将其归类为以下5种类型之一:
 
         1. factual:事实查询类问题,比如"什么是Python?""哪个是正确的?",只需要直接给出客观事实答案
         2. reasoning:推理/原因分析类问题,比如"为什么会报错?""如何实现这个功能?",需要解释原因或给出步骤
         3. summary:总结/概括类问题,比如"帮我总结一下这段内容""梳理要点",需要提炼核心信息
         4. multi_hop:多步推理/复杂查询类问题,比如"对比A和B的区别并说明优缺点""先做X再做Y会怎样?",需要多轮信息或多步逻辑才能回答
+        5. tool_call:需要实时信息/最新数据/联网搜索的问题,比如"今天天气怎么样?""最新的人工智能新闻""帮我查一下这个概念""现在几点"等,涉及当前时间、实时数据、网络搜索等
 
         用户问题:{question}
 
@@ -72,7 +73,7 @@ def intent_classification_node(
         raw_text = response.content if hasattr(response, 'content') else str(response)
 
         cleaned = _clean_think_tags(raw_text)
-        # 提取JSON里的"intent"键对应的字符串值
+        # 提取JSON里的"intent"键对应的字符串值,大模型的输出，经常不是 “干净的纯 JSON”。
         json_match = re.search(r'\{[^{}]*"intent"\s*:\s*"[^"]+?"[^{}]*\}', cleaned)
         if json_match:
             result = json.loads(json_match.group()) # .group() 方法返回匹配的字符串,.loads() 方法将字符串转换为Python对象

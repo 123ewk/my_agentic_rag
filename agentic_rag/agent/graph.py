@@ -487,8 +487,8 @@ class AgenticRAGGraph:
             }
         
         # 5. 工具调用阶段（如果需要）
-        use_tools = kwargs.get("use_tools", False)
-        if use_tools and initial_state.get("intent") == "tool_call":
+        # 当意图为 tool_call 时，自动调用工具
+        if initial_state.get("intent") == "tool_call":
             yield {
                 "type": "status",
                 "content": "正在调用工具...",

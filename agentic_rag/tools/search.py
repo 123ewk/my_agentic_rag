@@ -3,7 +3,7 @@
 """
 from typing import Dict, Any
 from langchain_core.tools import tool
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 # DDGS 全称是 DuckDuckGo Search,是一个免费、开源、无需 API 密钥的网络搜索工具
 @tool(description="使用DuckDuckGo搜索互联网信息")
