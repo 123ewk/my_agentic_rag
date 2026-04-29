@@ -286,10 +286,12 @@ def generation_node(state: AgentState, llm, prompt_template: str) -> AgentState:
     - 支持记忆上下文和对话历史
     - 上下文截断：避免过长上下文导致LLM输入超限
     - 按优先级保留：记忆 > 对话历史 > 检索文档
+    - CRAG支持：融合网络搜索结果
     """
     question = state["question"]
     context_docs = state.get("reranked_docs", [])
     tool_results = state.get("tool_results", {})
+    search_results = state.get("search_results", [])  # CRAG网络搜索结果
     conversation_history = state.get("conversation_history", [])
     memory_context = state.get("memory_context", [])
     settings = get_settings()
@@ -310,7 +312,11 @@ def generation_node(state: AgentState, llm, prompt_template: str) -> AgentState:
             memory_text = str(memory_context)
         context_parts.append(f"【相关记忆】\n{memory_text}")
 
-    if conversation_history:
+    # MiniMax模型会回显prompt中的对话历史，因此跳过对话历史传入
+    model_name = getattr(llm, 'model_name', '') or getattr(llm, 'model', '')
+    is_minimax = "minimax" in model_name.lower()
+    
+    if not is_minimax and conversation_history:
         history_lines = []
         for msg in conversation_history:
             role = "用户" if msg.get("role") == "user" else "助手"
@@ -318,10 +324,17 @@ def generation_node(state: AgentState, llm, prompt_template: str) -> AgentState:
             history_lines.append(f"{role}: {content}")
         if history_lines:
             context_parts.append(f"【对话历史】\n" + "\n".join(history_lines))
+    elif is_minimax and conversation_history:
+        logger.debug(f"MiniMax模型在generation_node中跳过对话历史，避免预览回显问题")
 
     if context_docs:
         docs_content = "\n\n".join([doc.page_content for doc in context_docs])
         context_parts.append(f"【检索到的文档】\n{docs_content}")
+
+    # CRAG: 添加网络搜索结果到上下文
+    if search_results:
+        search_content = "\n\n".join([doc.page_content for doc in search_results])
+        context_parts.append(f"【网络搜索结果】\n{search_content}")
 
     if tool_results and isinstance(tool_results, dict):
         tool_context = "\n\n【工具调用结果】\n"
@@ -405,3 +418,93 @@ def reflection_node(state: AgentState, llm) -> AgentState:
         "refined_answer": refined,
         "reflection_count": reflection_count + 1
     }
+
+
+def web_search_node(state: AgentState, llm) -> AgentState:
+    """
+    网络搜索节点(CRAG低置信度触发)
+    
+    当本地检索置信度不足时,通过网络搜索获取最新/更准确的信息
+    使用项目自带的duckduckgo_search工具
+    """
+    from langchain_core.documents import Document
+    question = state["question"]
+    logger.info(f"CRAG触发网络搜索: {question[:50]}...")
+    
+    try:
+        # 调用duckduckgo_search工具
+        search_text = duckduckgo_search.invoke({"query": question})
+        
+        if not search_text or search_text == "未找到相关结果":
+            logger.warning("网络搜索未返回结果")
+            return {
+                "search_results": [],
+                "needs_reflection": False
+            }
+        
+        # 将搜索结果转换为Document格式
+        # duckduckgo_search返回的是格式化文本，需要解析
+        docs = []
+        lines = search_text.split("\n")
+        current_result = {"title": "", "body": "", "url": ""}
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # 检查是否是结果编号行 (如 "1. 标题")
+            if line and line[0].isdigit() and ". " in line:
+                # 保存前一个结果
+                if current_result["title"] or current_result["body"]:
+                    content = f"标题: {current_result['title']}\n内容: {current_result['body']}\n来源: {current_result['url']}"
+                    doc = Document(
+                        page_content=content,
+                        metadata={
+                            "source": current_result["url"],
+                            "title": current_result["title"],
+                            "type": "web_search",
+                            "score": 1.0
+                        }
+                    )
+                    docs.append(doc)
+                
+                # 开始新的结果
+                title = line.split(". ", 1)[1] if ". " in line else line
+                current_result = {"title": title, "body": "", "url": ""}
+            
+            # 检查是否是来源行
+            elif line.startswith("来源:"):
+                current_result["url"] = line.replace("来源:", "").strip()
+            
+            # 否则是内容行
+            elif "   " in line:
+                current_result["body"] += line.strip() + " "
+        
+        # 保存最后一个结果
+        if current_result["title"] or current_result["body"]:
+            content = f"标题: {current_result['title']}\n内容: {current_result['body']}\n来源: {current_result['url']}"
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "source": current_result["url"],
+                    "title": current_result["title"],
+                    "type": "web_search",
+                    "score": 1.0
+                }
+            )
+            docs.append(doc)
+        
+        logger.info(f"网络搜索完成,获取到{len(docs)}条结果")
+        
+        return {
+            "search_results": docs,
+            "needs_reflection": True  # 网络搜索后可能需要反思
+        }
+        
+    except Exception as e:
+        logger.error(f"网络搜索失败: {e}")
+        return {
+            "search_results": [],
+            "needs_reflection": False
+        }

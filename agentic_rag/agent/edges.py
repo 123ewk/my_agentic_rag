@@ -37,7 +37,7 @@ def route_after_rerank(state: AgentState) -> Literal["generation", "tool_call"]:
     if isinstance(tool_calls, list) and tool_calls:
         return "tool_call"
     else:
-        return "generation"
+        return "confidence_evaluation"
 
 def route_after_tool_call(state: AgentState) -> Literal["generation"]:
     """工具调用后的路由"""
@@ -67,5 +67,35 @@ def route_after_reflection(state: AgentState) -> Literal["evaluation", "__end__"
     
     if reflection_count < max_reflection:
         return "evaluation"
+    else:
+        return "__end__"
+
+
+def route_after_confidence(state: AgentState) -> Literal["generation", "web_search"]:
+    """
+    CRAG置信度评估后的路由
+    
+    高/中置信度 -> generation (使用本地检索结果)
+    低置信度 -> web_search (触发网络搜索)
+    """
+    needs_web_search = state.get("needs_web_search", False)
+    
+    if needs_web_search:
+        return "web_search"
+    else:
+        return "generation"
+
+
+def route_after_web_search(state: AgentState) -> Literal["generation", "__end__"]:
+    """
+    网络搜索后的路由
+    
+    有搜索结果 -> generation (使用搜索结果重新生成)
+    无搜索结果 -> __end__ (返回已有答案)
+    """
+    search_results = state.get("search_results", [])
+    
+    if search_results:
+        return "generation"
     else:
         return "__end__"

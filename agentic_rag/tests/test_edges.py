@@ -10,7 +10,9 @@ from agentic_rag.agent.edges import (
     route_after_tool_call,
     route_after_generation,
     route_after_evaluation,
-    route_after_reflection
+    route_after_reflection,
+    route_after_confidence,
+    route_after_web_search
 )
 
 
@@ -202,4 +204,77 @@ class TestRouteAfterReflection:
             "metadata": {"max_reflection_steps": 2}
         }
         result = route_after_reflection(state)
+        assert result == "__end__"
+
+
+class TestRouteAfterConfidence:
+    """CRAG置信度评估后路由测试"""
+
+    def test_high_confidence_to_generation(self):
+        """测试高置信度路由到生成"""
+        state = {
+            "needs_web_search": False,
+            "confidence_level": "high",
+            "confidence_score": 0.8
+        }
+        result = route_after_confidence(state)
+        assert result == "generation"
+
+    def test_medium_confidence_to_generation(self):
+        """测试中等置信度路由到生成"""
+        state = {
+            "needs_web_search": False,
+            "confidence_level": "medium",
+            "confidence_score": 0.5
+        }
+        result = route_after_confidence(state)
+        assert result == "generation"
+
+    def test_low_confidence_to_web_search(self):
+        """测试低置信度路由到网络搜索"""
+        state = {
+            "needs_web_search": True,
+            "confidence_level": "low",
+            "confidence_score": 0.2
+        }
+        result = route_after_confidence(state)
+        assert result == "web_search"
+
+    def test_default_no_web_search(self):
+        """测试默认不触发网络搜索"""
+        state = {
+            "confidence_score": 0.6
+        }
+        result = route_after_confidence(state)
+        assert result == "generation"
+
+
+class TestRouteAfterWebSearch:
+    """网络搜索后路由测试"""
+
+    def test_with_results_to_generation(self):
+        """测试有搜索结果时路由到生成"""
+        state = {
+            "search_results": [
+                {"page_content": "结果1"},
+                {"page_content": "结果2"}
+            ]
+        }
+        result = route_after_web_search(state)
+        assert result == "generation"
+
+    def test_without_results_to_end(self):
+        """测试无搜索结果时结束"""
+        state = {
+            "search_results": []
+        }
+        result = route_after_web_search(state)
+        assert result == "__end__"
+
+    def test_empty_results_to_end(self):
+        """测试空结果时结束"""
+        state = {
+            "search_results": None
+        }
+        result = route_after_web_search(state)
         assert result == "__end__"

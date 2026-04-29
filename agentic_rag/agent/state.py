@@ -32,6 +32,12 @@ class AgentState(TypedDict):
     evaluation: Dict[str, float]             # 评估指标结果
     needs_reflection: bool                   # 是否需要反思
     
+    # CRAG置信度路由
+    confidence_score: Optional[float]        # 置信度得分(0-1)
+    confidence_level: Optional[str]           # 置信度等级: "high"/"medium"/"low"
+    needs_web_search: bool                  # 是否需要触发网络搜索
+    search_results: List[Document]           # 网络搜索结果
+    
     # 工具调用
     tool_results: Dict[str, Any]            # 工具调用结果
     tool_calls: List[str]                    # 调用的工具列表

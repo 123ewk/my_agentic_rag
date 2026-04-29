@@ -26,7 +26,8 @@ from .nodes import (
     tool_call_node,
     generation_node,
     evaluation_node,
-    reflection_node
+    reflection_node,
+    web_search_node
 )
 from .edges import (
     route_after_intent,
@@ -35,7 +36,8 @@ from .edges import (
     route_after_reflection,
     route_after_generation,
     route_after_tool_call,
-    route_after_rerank
+    route_after_rerank,
+    route_after_web_search
 )
 
 class AgenticRAGGraph:
@@ -191,7 +193,12 @@ class AgenticRAGGraph:
             "conversation_history": [],
             "reflection_count": 0,
             "error": None,
-            "metadata": kwargs
+            "metadata": kwargs,
+            # CRAG置信度路由字段
+            "confidence_score": None,
+            "confidence_level": None,
+            "needs_web_search": False,
+            "search_results": []
         }
         
         loop = asyncio.new_event_loop() # 创建一个全新的、独立的 asyncio 事件循环对象。
@@ -331,7 +338,12 @@ class AgenticRAGGraph:
             "conversation_history": [],
             "reflection_count": 0,
             "error": None,
-            "metadata": kwargs
+            "metadata": kwargs,
+            # CRAG置信度路由字段
+            "confidence_score": None,
+            "confidence_level": None,
+            "needs_web_search": False,
+            "search_results": []
         }
 
         # 加载短期记忆
@@ -522,8 +534,11 @@ class AgenticRAGGraph:
                 memory_text = str(memory_context)
             context_parts.append(f"【相关记忆】\n{memory_text}")
         
-        # 添加对话历史
-        if conversation_history:
+        # MiniMax模型会回显prompt中的对话历史，因此跳过对话历史传入
+        model_name = getattr(self.llm, 'model_name', '') or getattr(self.llm, 'model', '')
+        is_minimax = "minimax" in model_name.lower()
+        
+        if not is_minimax and conversation_history:
             history_lines = []
             for msg in conversation_history:
                 role = "用户" if msg.get("role") == "user" else "助手"
@@ -531,6 +546,8 @@ class AgenticRAGGraph:
                 history_lines.append(f"{role}: {content}")
             if history_lines:
                 context_parts.append(f"【对话历史】\n" + "\n".join(history_lines))
+        elif is_minimax and conversation_history:
+            logger.debug(f"MiniMax模型跳过对话历史传入，避免预览回显问题")
         
         # 添加检索文档
         if context_docs:
@@ -641,6 +658,76 @@ class AgenticRAGGraph:
                 "content": "评估完成",
                 "data": initial_state["evaluation"]
             }
+        
+        # 7.5 CRAG置信度路由（在评估后，复用overall_score，无额外延迟）
+        settings = get_settings()
+        if settings.crag_enabled:
+            evaluation_score = initial_state.get("evaluation", {}).get("overall_score", 0.5)
+            doc_count = len(initial_state.get("reranked_docs", []))
+            
+            # 无文档或评分低于低阈值 → 触发网络搜索
+            if doc_count == 0 or evaluation_score < settings.crag_confidence_threshold_low:
+                yield {
+                    "type": "status",
+                    "content": f"评估分数较低(score={evaluation_score:.2f})，正在搜索网络信息...",
+                    "data": {
+                        "stage": "crag_web_search",
+                        "overall_score": evaluation_score,
+                        "doc_count": doc_count
+                    }
+                }
+                state = web_search_node(initial_state, self.llm)
+                initial_state.update(state)
+                
+                # 如果有网络搜索结果，重新生成回答
+                if initial_state.get("search_results"):
+                    # 合并搜索结果到reranked_docs
+                    existing_docs = initial_state.get("reranked_docs", [])
+                    initial_state["reranked_docs"] = existing_docs + initial_state["search_results"]
+                    
+                    # 重新生成（复用生成逻辑）
+                    yield {
+                        "type": "status",
+                        "content": "使用网络搜索结果重新生成回答...",
+                        "data": {"stage": "regeneration"}
+                    }
+                    
+                    # 构建包含搜索结果的上下文
+                    context_parts = []
+                    if initial_state.get("memory_context"):
+                        memory_text = initial_state["memory_context"]
+                        if isinstance(memory_text, list):
+                            memory_text = "\n".join(memory_text)
+                        context_parts.append(f"【相关记忆】\n{memory_text}")
+                    if initial_state.get("conversation_history"):
+                        history_lines = []
+                        for msg in initial_state["conversation_history"]:
+                            role = "用户" if msg.get("role") == "user" else "助手"
+                            content = msg.get("content", "")
+                            history_lines.append(f"{role}: {content}")
+                        if history_lines:
+                            context_parts.append(f"【对话历史】\n" + "\n".join(history_lines))
+                    if initial_state.get("reranked_docs"):
+                        docs_content = "\n\n".join([doc.page_content for doc in initial_state["reranked_docs"]])
+                        context_parts.append(f"【检索到的文档+网络搜索结果】\n{docs_content}")
+                    
+                    context = "\n".join(context_parts) if context_parts else "（无相关上下文）"
+                    prompt = self.prompt_template.format(context=context, question=question)
+                    
+                    full_response = ""
+                    async for chunk in self.llm.astream(prompt):
+                        content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                        full_response += content
+                        think_pattern = r'<think\b[^>]*>.*?</think\s*>'
+                        cleaned_preview = re.sub(think_pattern, '', content, flags=re.DOTALL) if re.search(think_pattern, full_response, re.DOTALL) else content
+                        if cleaned_preview.strip():
+                            yield {
+                                "type": "chunk",
+                                "content": cleaned_preview,
+                                "data": {"partial_response": full_response, "regenerated": True}
+                            }
+                    
+                    initial_state["generation"] = _clean_think_tags(full_response)
         
         # 8. 反思阶段（如果需要）
         if initial_state.get("needs_reflection", False):

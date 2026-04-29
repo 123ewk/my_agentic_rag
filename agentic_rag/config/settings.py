@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     generation_cache_enabled: bool = True
     generation_cache_max_size: int = 100
     generation_cache_ttl: int = 3600  # 1小时
+    
+    # CRAG置信度路由配置
+    crag_enabled: bool = True  # 是否启用CRAG
+    crag_confidence_threshold_high: float = 0.7  # 高置信度阈值(>=此值认为是高置信度)
+    crag_confidence_threshold_low: float = 0.3  # 低置信度阈值(<此值触发网络搜索)
 
     class Config:
         env_file = ".env"
