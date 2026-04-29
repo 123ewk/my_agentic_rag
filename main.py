@@ -28,10 +28,6 @@ load_dotenv()
 # 配置日志
 logger = setup_logging()
 
-# 模块级别的变量
-app = None
-_main_loop = None  # 主事件循环，用于数据库连接
-
 def initialize_components():
     """初始化所有组件"""
     settings = get_settings()
@@ -93,10 +89,9 @@ def initialize_components():
         ttl_hours=24
     )
     # 连接数据库
-    global _main_loop
-    _main_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_main_loop)
-    _main_loop.run_until_complete(short_term_memory.connect())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(short_term_memory.connect())
     logger.info("短期记忆管理器初始化完成")
     
     # 7. 初始化长期记忆管理器
@@ -108,7 +103,7 @@ def initialize_components():
         similarity_threshold=settings.similarity_threshold
     )
     # 连接数据库
-    _main_loop.run_until_complete(long_term_memory.connect())
+    loop.run_until_complete(long_term_memory.connect())
     logger.info("长期记忆管理器初始化完成")
     
     # 8. 定义提示词模板
@@ -232,19 +227,18 @@ def graceful_shutdown(short_term_scheduler, long_term_scheduler, short_term_memo
         
         # 2. 关闭数据库连接
         logger.info("正在关闭数据库连接...")
-        global _main_loop
-        if _main_loop and not _main_loop.is_closed():
-            try:
-                if short_term_memory:
-                    _main_loop.run_until_complete(short_term_memory.close())
-                    logger.info("短期记忆数据库连接已关闭")
-                
-                if long_term_memory:
-                    _main_loop.run_until_complete(long_term_memory.close())
-                    logger.info("长期记忆数据库连接已关闭")
-            finally:
-                if not _main_loop.is_closed():
-                    _main_loop.close()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            if short_term_memory:
+                loop.run_until_complete(short_term_memory.close())
+                logger.info("短期记忆数据库连接已关闭")
+            
+            if long_term_memory:
+                loop.run_until_complete(long_term_memory.close())
+                logger.info("长期记忆数据库连接已关闭")
+        finally:
+            loop.close()
         
         logger.info("系统优雅关闭完成")
         logger.info("=" * 50)
@@ -311,7 +305,6 @@ def main():
     )
     
     # 创建API应用
-    global app
     app = create_app()
     
     # 启动服务
@@ -323,20 +316,11 @@ def main():
     if settings.is_production:
         uvicorn.run(
             app,
+            reload=not settings.is_production,
             host="127.0.0.1",
             port=settings.api_port,
             log_level=settings.log_level.lower()
         )
-        logger.info("生产环境服务已启动")
-    else:
-        uvicorn.run(
-            "main:app",
-            reload=True,
-            host="127.0.0.1",
-            port=settings.api_port,
-            log_level=settings.log_level.lower()
-        )
-        logger.info("开发服务已启动")
 
 if __name__ == "__main__":
     main()

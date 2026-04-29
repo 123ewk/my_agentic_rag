@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     """
     全局配置类
     """
-    is_production: bool = False
-    
+    is_production: bool = True
+
     # LLM 配置
     llm_name: str = "Qwen3.5-plus"
     llm_temperature: float = 0.7
