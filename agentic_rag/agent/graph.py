@@ -36,8 +36,7 @@ from .edges import (
     route_after_reflection,
     route_after_generation,
     route_after_tool_call,
-    route_after_rerank,
-    route_after_web_search
+    route_after_rerank
 )
 
 class AgenticRAGGraph:
@@ -659,57 +658,57 @@ class AgenticRAGGraph:
                 "data": initial_state["evaluation"]
             }
         
-        # 7.5 CRAG置信度路由（在评估后，复用overall_score，无额外延迟）
+        # 7.5 CRAG置信度路由（复用evaluation的overall_score，无额外LLM调用）
         settings = get_settings()
         if settings.crag_enabled:
-            evaluation_score = initial_state.get("evaluation", {}).get("overall_score", 0.5)
+            evaluation_data = initial_state.get("evaluation", {})
+            overall_score = evaluation_data.get("overall_score", 0.5)
+            confidence_level = initial_state.get("confidence_level", "medium")
             doc_count = len(initial_state.get("reranked_docs", []))
             
-            # 无文档或评分低于低阈值 → 触发网络搜索
-            if doc_count == 0 or evaluation_score < settings.crag_confidence_threshold_low:
+            logger.info(
+                f"CRAG路由: confidence={confidence_level}, score={overall_score:.3f}, "
+                f"docs={doc_count}, threshold_low={settings.crag_confidence_threshold_low}"
+            )
+            
+            # 低置信度 → 触发网络搜索
+            if confidence_level == "low":
                 yield {
                     "type": "status",
-                    "content": f"评估分数较低(score={evaluation_score:.2f})，正在搜索网络信息...",
+                    "content": f"置信度较低({confidence_level}, score={overall_score:.2f})，正在搜索网络信息...",
                     "data": {
                         "stage": "crag_web_search",
-                        "overall_score": evaluation_score,
+                        "confidence_level": confidence_level,
+                        "overall_score": overall_score,
                         "doc_count": doc_count
                     }
                 }
                 state = web_search_node(initial_state, self.llm)
                 initial_state.update(state)
                 
-                # 如果有网络搜索结果，重新生成回答
                 if initial_state.get("search_results"):
-                    # 合并搜索结果到reranked_docs
+                    # 合并搜索结果
                     existing_docs = initial_state.get("reranked_docs", [])
                     initial_state["reranked_docs"] = existing_docs + initial_state["search_results"]
                     
-                    # 重新生成（复用生成逻辑）
+                    logger.info(f"CRAG: 网络搜索获取{len(initial_state['search_results'])}条结果，重新生成回答")
+                    
                     yield {
                         "type": "status",
                         "content": "使用网络搜索结果重新生成回答...",
                         "data": {"stage": "regeneration"}
                     }
                     
-                    # 构建包含搜索结果的上下文
+                    # 重新生成（只构建必要上下文）
                     context_parts = []
+                    if initial_state.get("reranked_docs"):
+                        docs_content = "\n\n".join([doc.page_content for doc in initial_state["reranked_docs"]])
+                        context_parts.append(f"【检索到的文档+网络搜索结果】\n{docs_content}")
                     if initial_state.get("memory_context"):
                         memory_text = initial_state["memory_context"]
                         if isinstance(memory_text, list):
                             memory_text = "\n".join(memory_text)
                         context_parts.append(f"【相关记忆】\n{memory_text}")
-                    if initial_state.get("conversation_history"):
-                        history_lines = []
-                        for msg in initial_state["conversation_history"]:
-                            role = "用户" if msg.get("role") == "user" else "助手"
-                            content = msg.get("content", "")
-                            history_lines.append(f"{role}: {content}")
-                        if history_lines:
-                            context_parts.append(f"【对话历史】\n" + "\n".join(history_lines))
-                    if initial_state.get("reranked_docs"):
-                        docs_content = "\n\n".join([doc.page_content for doc in initial_state["reranked_docs"]])
-                        context_parts.append(f"【检索到的文档+网络搜索结果】\n{docs_content}")
                     
                     context = "\n".join(context_parts) if context_parts else "（无相关上下文）"
                     prompt = self.prompt_template.format(context=context, question=question)
@@ -728,6 +727,9 @@ class AgenticRAGGraph:
                             }
                     
                     initial_state["generation"] = _clean_think_tags(full_response)
+                    logger.info(f"CRAG: 重新生成完成，新回答长度={len(initial_state['generation'])}")
+            else:
+                logger.info(f"CRAG: 置信度{confidence_level}(score={overall_score:.3f})，无需网络搜索")
         
         # 8. 反思阶段（如果需要）
         if initial_state.get("needs_reflection", False):
@@ -783,6 +785,10 @@ class AgenticRAGGraph:
                 "reflection_count": initial_state.get("reflection_count", 0),
                 "tools_used": list(initial_state.get("tool_results", {}).keys()),
                 "think_content": think_content,
-                "has_think": bool(think_content)
+                "has_think": bool(think_content),
+                "confidence_score": initial_state.get("confidence_score"),
+                "confidence_level": initial_state.get("confidence_level"),
+                "overall_score": initial_state.get("evaluation", {}).get("overall_score"),
+                "crag_triggered": initial_state.get("needs_web_search", False)
             }
         }

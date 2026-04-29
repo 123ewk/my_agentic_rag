@@ -360,32 +360,98 @@ def generation_node(state: AgentState, llm, prompt_template: str) -> AgentState:
     return {"generation": generation}
 
 def evaluation_node(state: AgentState, llm) -> AgentState:
-    """评估节点(轻量级版本,不调用LLM)"""
+    """
+    评估节点(轻量级版本,不调用LLM)
+    
+    评估维度：
+    - faithfulness: 回答忠实度（基于回答长度和上下文覆盖率）
+    - answer_relevancy: 回答相关性（基于文档与问题的关键词重叠度）
+    - context_precision: 上下文精确度（基于文档数量和相关性得分）
+    - completeness: 回答完整性
+    
+    CRAG依赖overall_score判断是否触发网络搜索
+    """
     question = state["question"]
     answer = state["generation"]
     context_docs = state.get("reranked_docs", [])
     
-    # 简单评估(不调用LLM,只做关键词匹配)
     answer_len = len(answer) if answer else 0
     context_len = sum(len(doc.page_content) for doc in context_docs) if context_docs else 0
     
-    # 基于回答长度和上下文覆盖率的简单评估
+    # 1. 忠实度：回答越长且上下文越丰富，越可能忠实
     faithfulness = min(1.0, answer_len / 200) if answer_len > 0 else 0.0
-    answer_relevancy = 0.8 if context_docs else 0.5  # 有上下文时默认高分
-    context_precision = len(context_docs) / 5.0 if context_docs else 0.0
     
-    # 判断是否需要反思(如果回答太短或者没有上下文)
-    needs_reflection = answer_len < 50 or (not context_docs and context_len == 0)
+    # 2. 回答相关性：基于问题关键词在文档中的出现率
+    # 提取问题中的关键词（简单分词：按空格和标点分割，过滤短词）
+    question_keywords = set(
+        w.lower() for w in re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]{2,}', question)
+    )
+    
+    if context_docs and question_keywords:
+        # 计算关键词在文档中的覆盖率
+        all_doc_text = " ".join(doc.page_content for doc in context_docs).lower()
+        matched = sum(1 for kw in question_keywords if kw in all_doc_text)
+        keyword_coverage = matched / len(question_keywords) if question_keywords else 0.0
+        answer_relevancy = min(1.0, keyword_coverage * 1.2)  # 略微放大，0.8以上算好
+    elif context_docs:
+        # 有文档但无法提取关键词，给中等分数
+        answer_relevancy = 0.5
+    else:
+        # 无文档，相关性低
+        answer_relevancy = 0.1
+    
+    # 3. 上下文精确度：基于文档的reranker得分
+    if context_docs:
+        relevance_scores = [doc.metadata.get("score", 0.5) for doc in context_docs]
+        avg_score = sum(relevance_scores) / len(relevance_scores)
+        context_precision = min(1.0, avg_score * len(context_docs) / 3.0)
+    else:
+        context_precision = 0.0
+    
+    # 4. 完整性
+    completeness = min(1.0, answer_len / 500)
+    
+    # 综合评分
+    overall_score = (
+        faithfulness * 0.25 +
+        answer_relevancy * 0.35 +
+        context_precision * 0.25 +
+        completeness * 0.15
+    )
+    
+    # 判断是否需要反思
+    needs_reflection = answer_len < 50 or overall_score < 0.3
+    
+    # CRAG置信度等级（基于overall_score）
+    settings = get_settings()
+    if settings.crag_enabled:
+        if overall_score >= settings.crag_confidence_threshold_high:
+            confidence_level = "high"
+        elif overall_score >= settings.crag_confidence_threshold_low:
+            confidence_level = "medium"
+        else:
+            confidence_level = "low"
+    else:
+        confidence_level = "high"
+    
+    logger.info(
+        f"评估结果: overall={overall_score:.3f}, "
+        f"faith={faithfulness:.2f}, relevancy={answer_relevancy:.2f}, "
+        f"precision={context_precision:.2f}, completeness={completeness:.2f}, "
+        f"confidence={confidence_level}, docs={len(context_docs)}"
+    )
     
     return {
         "evaluation": {
             "faithfulness": faithfulness,
             "answer_relevancy": answer_relevancy,
             "context_precision": context_precision,
-            "completeness": min(1.0, answer_len / 500),
-            "overall_score": (faithfulness * 0.35 + answer_relevancy * 0.35 + context_precision * 0.15 + min(1.0, answer_len / 500) * 0.15)
+            "completeness": completeness,
+            "overall_score": overall_score
         },
         "needs_reflection": needs_reflection,
+        "confidence_score": overall_score,
+        "confidence_level": confidence_level,
     }
 
 
