@@ -9,19 +9,20 @@ from loguru import logger
 
 async def init_memory_tables(database_url: str):
     """
-    初始化记忆相关的数据库表
-    
+    初始化记忆相关的数据库表(包含V1和V2)
+
     Args:
         database_url: PostgreSQL连接字符串
     """
     from sqlalchemy.ext.asyncio import create_async_engine
-    
+
     engine = create_async_engine(database_url, echo=False)
-    
+
     try:
         async with engine.begin() as conn:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            
+
+            # V1表(兼容保留)
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS conversation_sessions (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -36,7 +37,7 @@ async def init_memory_tables(database_url: str):
                     CONSTRAINT unique_session_message UNIQUE (session_id, message_index)
                 )
             """))
-            
+
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS long_term_memories (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -49,31 +50,83 @@ async def init_memory_tables(database_url: str):
                     CONSTRAINT content_not_empty CHECK (char_length(content) > 0)
                 )
             """))
-            
+
+            # V2表(四类型分类 + 价值评分 + 摘要 + 访问统计)
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS long_term_memories_v2 (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id VARCHAR(128) NOT NULL,
+                    memory_type VARCHAR(32) NOT NULL,
+                    content TEXT NOT NULL,
+                    summary VARCHAR(256) NOT NULL DEFAULT '',
+                    embedding vector(1024),
+                    value_score REAL NOT NULL DEFAULT 0.5,
+                    metadata JSONB DEFAULT '{}',
+                    source_session_ids VARCHAR(128)[] DEFAULT '{}',
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    supersedes_id UUID,
+                    CONSTRAINT v2_content_not_empty CHECK (char_length(content) > 0),
+                    CONSTRAINT v2_valid_memory_type CHECK (memory_type IN ('user_profile', 'fact', 'experience', 'preference')),
+                    CONSTRAINT v2_valid_value_score CHECK (value_score >= 0 AND value_score <= 1)
+                )
+            """))
+
+            # V1索引
             await conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_conversation_session_id 
                 ON conversation_sessions(session_id)
             """))
-            
+
             await conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_conversation_expires 
                 ON conversation_sessions(expires_at) WHERE expires_at IS NOT NULL
             """))
-            
+
             await conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_long_term_user_id 
                 ON long_term_memories(user_id)
             """))
-            
+
             await conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_long_term_embedding 
                 ON long_term_memories 
                 USING hnsw (embedding vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64)
             """))
-            
-        logger.info("✅ 数据库表初始化完成")
-        
+
+            # V2索引
+            await conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_v2_memory_type_user 
+                ON long_term_memories_v2(user_id, memory_type)
+            """))
+
+            await conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_v2_value_score 
+                ON long_term_memories_v2(user_id, value_score)
+            """))
+
+            await conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_v2_embedding 
+                ON long_term_memories_v2
+                USING hnsw (embedding vector_cosine_ops)
+                WITH (m = 16, ef_construction = 64)
+            """))
+
+            await conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_v2_last_accessed 
+                ON long_term_memories_v2(user_id, last_accessed_at DESC)
+            """))
+
+            await conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_v2_user_created 
+                ON long_term_memories_v2(user_id, created_at DESC)
+            """))
+
+        logger.info("✅ 数据库表初始化完成(含V2)")
+
     except Exception as e:
         logger.error(f"数据库表初始化失败: {e}")
         raise

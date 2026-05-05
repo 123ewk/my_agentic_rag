@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     # 记忆配置
     short_term_memory_k: int = 10
     long_term_memory_k: int = 3
+    # V2: 每用户最大记忆数量(超出时淘汰低价值记忆)
+    long_term_memory_max_per_user: int = 500
     
     # 反思配置（优化F：默认关闭reflection，仅在用户显式请求时启用）
     max_reflection_steps: int = 0

@@ -19,7 +19,7 @@ from agentic_rag.evaluation.metrics import evaluate_response
 from agentic_rag.api.routes import create_app
 from agentic_rag.api.db_init import init_memory_tables_sync
 from agentic_rag.memory.short_term import ShortTermMemory
-from agentic_rag.memory.long_term import LongTermMemory
+from agentic_rag.memory.long_term_v2 import LongTermMemoryV2
 from agentic_rag.schedulers.long_scheduler import get_scheduler as get_scheduler
 
 # 加载环境变量
@@ -94,13 +94,15 @@ def initialize_components():
     loop.run_until_complete(short_term_memory.connect())
     logger.info("短期记忆管理器初始化完成")
     
-    # 7. 初始化长期记忆管理器
-    logger.info("初始化长期记忆管理器...")
-    long_term_memory = LongTermMemory(
+    # 7. 初始化长期记忆管理器(V2: 价值筛选+四类型分类+分层检索)
+    logger.info("初始化长期记忆管理器(V2)...")
+    long_term_memory = LongTermMemoryV2(
         embeddings=embeddings,
+        llm=llm,
         database_url=settings.database_url,
         k=settings.long_term_memory_k,
-        similarity_threshold=settings.similarity_threshold
+        similarity_threshold=settings.similarity_threshold,
+        max_memories_per_user=settings.long_term_memory_max_per_user,
     )
     # 连接数据库
     loop.run_until_complete(long_term_memory.connect())

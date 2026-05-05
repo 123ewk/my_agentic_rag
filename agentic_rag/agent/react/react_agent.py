@@ -60,9 +60,10 @@ REACT_SYSTEM_PROMPT = """你是一个智能AI助手，通过观察-思考-行动
 
 ## 决策规则
 
-- 如果还没有检索过，优先检索知识库
+- 先判断是否需要检索知识库(根据你是否有相关信息,是否是要企业内部数据进行分析等依据来判断)
+- 如果要检索知识库，并且还没有检索过，优先检索知识库
 - 如果检索结果不够好，可以改写查询重新检索
-- 如果知识库信息不足，可以搜索互联网
+- 如果知识库信息不足，可以搜索互联网获取最新信息
 - 如果信息足够，生成回答
 - 如果回答已经完整且准确，结束
 
@@ -81,7 +82,7 @@ REACT_SYSTEM_PROMPT = """你是一个智能AI助手，通过观察-思考-行动
 # 优化H：压缩版ReAct System Prompt，减少每步~500 tokens输入
 REACT_SYSTEM_PROMPT_COMPACT = """AI助手。工具:{tools_description}
 行动:retrieve(query)/web_search(query)/query_rewrite(query,strategy)/tool_call(name,args)/generate/finish
-规则:先检索→不够则搜索→足够则生成→完成则结束
+规则:先判断是否需要检索知识库->要则先检索→不够则搜索→足够则生成→完成则结束
 状态:问题={question} 步骤={step_count} 信息={information_summary} 历史={action_history}
 输出JSON:{{"thought":"...","action":"...","action_input":{{...}}}}"""
 
@@ -274,6 +275,9 @@ class ReActAgent:
         """
         加载短期和长期记忆到state中
 
+        V2改进: 长期记忆使用分层检索(search_with_decay)，
+        按类型预筛→向量搜索→综合排序→数量限制
+
         参数:
             state: 当前状态
             kwargs: 包含session_id和user_id的参数
@@ -289,7 +293,7 @@ class ReActAgent:
                 for msg in messages:
                     role = "user" if hasattr(msg, "type") and msg.type == "human" else "assistant"
                     history.append({"role": role, "content": msg.content})
-                state["conversation_history"] = history
+                state["conversation_history"] = history 
 
                 context = await self.short_term_memory.get_context(session_id)
                 state["memory_context"] = context.split("\n") if context else []
@@ -298,16 +302,37 @@ class ReActAgent:
 
         if self.long_term_memory and user_id:
             try:
-                memories = await self.long_term_memory.search(user_id, question)
+                # V2: 使用分层检索(带时间衰减和类型预筛)
+                if hasattr(self.long_term_memory, 'search_with_decay'):
+                    memories = await self.long_term_memory.search_with_decay(
+                        user_id=user_id,
+                        query=question,
+                    )
+                else:
+                    memories = await self.long_term_memory.search(user_id, question)
+
                 if memories:
                     existing = state.get("memory_context", [])
-                    state["memory_context"] = existing + [m["content"] for m in memories]
+                    # V2: 优先使用summary构建上下文(更紧凑)
+                    memory_contents = []
+                    for m in memories:
+                        summary = m.get("summary", "")
+                        content = m.get("content", "")
+                        mem_type = m.get("memory_type", "fact")
+                        if summary:
+                            memory_contents.append(f"[{mem_type}] {summary}: {content}")
+                        else:
+                            memory_contents.append(content)
+                    state["memory_context"] = existing + memory_contents
             except Exception as e:
                 logger.warning(f"搜索长期记忆失败: {e}")
 
     async def _save_memories(self, state: Dict, kwargs: Dict):
         """
         保存对话到短期和长期记忆
+
+        V2改进: 长期记忆走价值评估+压缩+去重流程，
+        不再直接拼接原始文本写入
 
         参数:
             state: 当前状态
@@ -331,17 +356,31 @@ class ReActAgent:
 
         if self.long_term_memory and user_id:
             try:
-                memory_content = self._build_memory_content(state, question)
-                if memory_content:
-                    await self.long_term_memory.save_memory(
+                # V2: 使用save_from_conversation走完整提取流程
+                if hasattr(self.long_term_memory, 'save_from_conversation'):
+                    await self.long_term_memory.save_from_conversation(
                         user_id=user_id,
-                        content=memory_content,
+                        question=question,
+                        answer=answer,
                         session_id=session_id,
-                        metadata={
+                        context={
                             "steps": state.get("current_step", 0),
                             "tools_used": list(state.get("tool_results", {}).keys()),
                         },
                     )
+                else:
+                    # 兼容V1: 直接保存
+                    memory_content = self._build_memory_content(state, question)
+                    if memory_content:
+                        await self.long_term_memory.save_memory(
+                            user_id=user_id,
+                            content=memory_content,
+                            session_id=session_id,
+                            metadata={
+                                "steps": state.get("current_step", 0),
+                                "tools_used": list(state.get("tool_results", {}).keys()),
+                            },
+                        )
             except Exception as e:
                 logger.warning(f"保存长期记忆失败: {e}")
 

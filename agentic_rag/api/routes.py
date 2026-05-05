@@ -74,6 +74,7 @@ def create_agent() -> Any:
     from agentic_rag.tools.search import get_search_tools
     from agentic_rag.memory.short_term import ShortTermMemory
     from agentic_rag.memory.long_term import LongTermMemory
+    from agentic_rag.memory.long_term_v2 import LongTermMemoryV2
 
     settings = get_settings()
     
@@ -151,15 +152,17 @@ def create_agent() -> Any:
             logger.warning(f"短期记忆初始化失败: {e}")
             short_term_memory = None
     
-    # 初始化长期记忆
+    # 初始化长期记忆(V2: 价值筛选+四类型分类+分层检索)
     long_term_memory = None
     if settings.database_url and embeddings:
         try:
-            long_term_memory = LongTermMemory(
+            long_term_memory = LongTermMemoryV2(
                 embeddings=embeddings,
+                llm=llm,
                 database_url=settings.database_url,
                 k=5,
-                similarity_threshold=0.7
+                similarity_threshold=0.7,
+                max_memories_per_user=settings.long_term_memory_max_per_user,
             )
             import asyncio
             try:

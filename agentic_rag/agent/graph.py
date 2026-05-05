@@ -375,10 +375,34 @@ class AgenticRAGGraph:
             logger.warning(f"加载短期记忆失败: {e}")
     
     async def _search_long_term_memory(self, state: Dict, user_id: str, query: str):
-        """搜索长期记忆"""
+        """
+        搜索长期记忆
+
+        V2改进: 使用分层检索(search_with_decay)
+        """
         try:
-            memories = await self.long_term_memory.search(user_id, query)
-            state["memory_context"] = [m["content"] for m in memories]
+            # V2: 使用分层检索(带时间衰减和类型预筛)
+            if hasattr(self.long_term_memory, 'search_with_decay'):
+                memories = await self.long_term_memory.search_with_decay(
+                    user_id=user_id,
+                    query=query,
+                )
+            else:
+                memories = await self.long_term_memory.search(user_id, query)
+
+            if memories:
+                memory_contents = []
+                for m in memories:
+                    summary = m.get("summary", "")
+                    content = m.get("content", "")
+                    mem_type = m.get("memory_type", "fact")
+                    if summary:
+                        memory_contents.append(f"[{mem_type}] {summary}: {content}")
+                    else:
+                        memory_contents.append(content)
+                state["memory_context"] = memory_contents
+            else:
+                state["memory_context"] = []
         except Exception as e:
             logger.warning(f"搜索长期记忆失败: {e}")
     
@@ -413,7 +437,11 @@ class AgenticRAGGraph:
         return "\n".join(memory_parts)
 
     async def _save_memories(self, state: Dict, question: str, session_id: str = None, user_id: str = None):
-        """保存对话到短期和长期记忆"""
+        """
+        保存对话到短期和长期记忆
+
+        V2改进: 长期记忆走价值评估+压缩+去重流程
+        """
         if self.short_term_memory and session_id:
             try:
                 await self.short_term_memory.add_message(
@@ -424,21 +452,38 @@ class AgenticRAGGraph:
                 )
             except Exception as e:
                 logger.warning(f"保存对话到短期记忆失败: {e}")
-        
+
         if self.long_term_memory and user_id:
             try:
-                memory_content = self._build_memory_content(state, question)
-                if memory_content:
-                    await self.long_term_memory.save_memory(
-                        user_id=user_id,
-                        content=memory_content,
-                        session_id=session_id,
-                        metadata={
-                            "intent": state.get("intent"),
-                            "reflection_count": state.get("reflection_count", 0),
-                            "tools_used": list(state.get("tool_results", {}).keys())
-                        }
-                    )
+                answer = state.get("generation", "") or state.get("refined_answer", "")
+                if answer:
+                    # V2: 使用save_from_conversation走完整提取流程
+                    if hasattr(self.long_term_memory, 'save_from_conversation'):
+                        await self.long_term_memory.save_from_conversation(
+                            user_id=user_id,
+                            question=question,
+                            answer=answer,
+                            session_id=session_id,
+                            context={
+                                "intent": state.get("intent"),
+                                "reflection_count": state.get("reflection_count", 0),
+                                "tools_used": list(state.get("tool_results", {}).keys()),
+                            },
+                        )
+                    else:
+                        # 兼容V1
+                        memory_content = self._build_memory_content(state, question)
+                        if memory_content:
+                            await self.long_term_memory.save_memory(
+                                user_id=user_id,
+                                content=memory_content,
+                                session_id=session_id,
+                                metadata={
+                                    "intent": state.get("intent"),
+                                    "reflection_count": state.get("reflection_count", 0),
+                                    "tools_used": list(state.get("tool_results", {}).keys()),
+                                },
+                            )
                     logger.info(f"已保存对话到长期记忆 (user_id: {user_id})")
             except Exception as e:
                 logger.warning(f"保存对话到长期记忆失败: {e}")
@@ -747,11 +792,27 @@ class AgenticRAGGraph:
             logger.warning(f"加载短期记忆失败: {e}")
 
     async def _search_long_term_memory_stream(self, state: Dict, user_id: str, question: str):
-        """流式模式下搜索长期记忆"""
+        """流式模式下搜索长期记忆(V2: 分层检索)"""
         try:
-            memories = await self.long_term_memory.search(user_id, question)
+            if hasattr(self.long_term_memory, 'search_with_decay'):
+                memories = await self.long_term_memory.search_with_decay(
+                    user_id=user_id,
+                    query=question,
+                )
+            else:
+                memories = await self.long_term_memory.search(user_id, question)
+
             if memories:
                 existing_context = state.get("memory_context", [])
-                state["memory_context"] = existing_context + [m["content"] for m in memories]
+                memory_contents = []
+                for m in memories:
+                    summary = m.get("summary", "")
+                    content = m.get("content", "")
+                    mem_type = m.get("memory_type", "fact")
+                    if summary:
+                        memory_contents.append(f"[{mem_type}] {summary}: {content}")
+                    else:
+                        memory_contents.append(content)
+                state["memory_context"] = existing_context + memory_contents
         except Exception as e:
             logger.warning(f"搜索长期记忆失败: {e}")
