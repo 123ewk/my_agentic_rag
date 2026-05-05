@@ -23,8 +23,10 @@ import json
 import asyncio
 from typing import Dict, Any, List, Optional, AsyncIterator
 
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.documents import Document
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field
 
 from .state import Action, ActionResult
 from .safety import SafetyPolicy, HallucinationGuard
@@ -82,6 +84,80 @@ REACT_SYSTEM_PROMPT_COMPACT = """AI助手。工具:{tools_description}
 规则:先检索→不够则搜索→足够则生成→完成则结束
 状态:问题={question} 步骤={step_count} 信息={information_summary} 历史={action_history}
 输出JSON:{{"thought":"...","action":"...","action_input":{{...}}}}"""
+
+
+# ========== Function Calling 工具定义 ==========
+
+class _RetrieveInput(BaseModel):
+    """检索行动的输入参数"""
+    query: str = Field(description="检索查询关键词")
+
+class _WebSearchInput(BaseModel):
+    """网络搜索行动的输入参数"""
+    query: str = Field(description="网络搜索关键词")
+
+class _QueryRewriteInput(BaseModel):
+    """查询改写行动的输入参数"""
+    query: str = Field(description="原始查询")
+    strategy: str = Field(default="all", description="改写策略: expansion/decomposition/all")
+
+class _ToolCallInput(BaseModel):
+    """外部工具调用行动的输入参数"""
+    name: str = Field(description="工具名称")
+    args: dict = Field(default_factory=dict, description="工具调用参数")
+
+class _GenerateInput(BaseModel):
+    """生成回答行动的输入参数"""
+    reasoning: str = Field(default="", description="选择直接生成回答的原因")
+
+class _FinishInput(BaseModel):
+    """结束循环行动的输入参数"""
+    reasoning: str = Field(default="", description="认为回答已完成的原因")
+
+
+def _action_noop(**kwargs):
+    """Agent决策占位函数，实际执行由_act方法处理"""
+    pass
+
+
+ACTION_TOOLS = [
+    StructuredTool.from_function(
+        func=_action_noop,
+        name="retrieve",
+        description="从知识库检索相关文档。当需要查找信息、回答事实性问题时优先使用。",
+        args_schema=_RetrieveInput,
+    ),
+    StructuredTool.from_function(
+        func=_action_noop,
+        name="web_search",
+        description="搜索互联网获取最新信息。当知识库信息不足或需要实时数据时使用。",
+        args_schema=_WebSearchInput,
+    ),
+    StructuredTool.from_function(
+        func=_action_noop,
+        name="query_rewrite",
+        description="改写查询以获得更好的检索结果。当检索结果不理想或需要多角度检索时使用。",
+        args_schema=_QueryRewriteInput,
+    ),
+    StructuredTool.from_function(
+        func=_action_noop,
+        name="tool_call",
+        description="调用特定外部工具（如计算器等）。当需要执行特定计算或操作时使用。",
+        args_schema=_ToolCallInput,
+    ),
+    StructuredTool.from_function(
+        func=_action_noop,
+        name="generate",
+        description="基于已有信息生成回答。当已收集到足够信息可以回答用户问题时使用。",
+        args_schema=_GenerateInput,
+    ),
+    StructuredTool.from_function(
+        func=_action_noop,
+        name="finish",
+        description="输出最终答案并结束循环。当回答已经完整且准确，无需进一步操作时使用。",
+        args_schema=_FinishInput,
+    ),
+]
 
 
 class ReActAgent:
@@ -342,11 +418,71 @@ class ReActAgent:
 
     async def _think(self, observation: str, state: Dict) -> Action:
         """
-        LLM驱动的行动规划
+        LLM驱动的行动规划（优先使用Function Calling）
 
-        这是ReAct循环的核心：LLM基于观察自主决定下一步行动。
-        与DAG的route_after_*不同，这里没有硬编码的路由规则，
-        LLM根据当前局势自主选择最合适的行动。
+        使用llm.bind_tools()绑定行动工具，LLM通过原生function calling
+        选择下一步行动，替代脆弱的JSON正则解析。
+        当LLM不支持function calling时，回退到JSON解析模式。
+
+        参数:
+            observation: 当前观察
+            state: 当前状态
+
+        返回:
+            Agent选择的行动
+        """
+        think_prompt = self._build_think_prompt(state)
+        messages = [
+            SystemMessage(content=think_prompt),
+            HumanMessage(content=observation),
+        ]
+
+        try:
+            llm_with_tools = self.llm.bind_tools(ACTION_TOOLS)
+            response = await llm_with_tools.ainvoke(messages)
+
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                tc = response.tool_calls[0]
+                action_type = tc['name']
+                action_input = dict(tc.get('args', {}))
+                reasoning = action_input.pop('reasoning', '') or ''
+
+                # 如果reasoning为空，尝试从response.content中提取
+                if not reasoning and hasattr(response, 'content') and response.content:
+                    reasoning = str(response.content)[:200]
+
+                valid_types = {"retrieve", "web_search", "query_rewrite", "tool_call", "generate", "finish"}
+                if action_type not in valid_types:
+                    logger.warning(f"Function calling返回无效行动类型: {action_type}, 回退到generate")
+                    return Action(type="generate", input={}, reasoning=f"无效行动类型: {action_type}")
+
+                logger.info(f"Function calling决策: {action_type}({json.dumps(action_input, ensure_ascii=False)[:80]})")
+                return Action(type=action_type, input=action_input, reasoning=reasoning)
+
+            # 回退：LLM返回了文本内容而非tool_calls，尝试JSON解析
+            raw_text = response.content if hasattr(response, 'content') else str(response)
+            raw_text = _clean_think_tags(raw_text)
+
+            if raw_text and raw_text.strip():
+                logger.info("LLM未返回tool_calls，回退到JSON解析模式")
+                return await self._think_with_json(observation, state)
+
+            return Action(type="generate", input={}, reasoning="LLM未返回有效决策")
+
+        except (NotImplementedError, TypeError):
+            # LLM不支持bind_tools，回退到JSON解析模式
+            logger.info("LLM不支持function calling，使用JSON解析模式")
+            return await self._think_with_json(observation, state)
+        except Exception as e:
+            logger.warning(f"Think阶段失败: {e}, 回退到generate")
+            return Action(type="generate", input={}, reasoning=f"思考失败: {str(e)}")
+
+    async def _think_with_json(self, observation: str, state: Dict) -> Action:
+        """
+        JSON解析模式的Think（回退方案）
+
+        当LLM不支持function calling时，使用prompt引导LLM输出JSON，
+        再通过括号匹配算法提取和解析。支持嵌套JSON结构。
 
         参数:
             observation: 当前观察
@@ -357,7 +493,6 @@ class ReActAgent:
         """
         tools_desc = self.tool_registry.get_description()
 
-        # 优化H：使用压缩版prompt减少token消耗
         prompt = REACT_SYSTEM_PROMPT_COMPACT.format(
             tools_description=tools_desc,
             question=state["question"],
@@ -373,22 +508,55 @@ class ReActAgent:
 
         try:
             response = await self.llm.ainvoke(messages)
-            raw_text = response.content if hasattr(response, "content") else str(response)
+            raw_text = response.content if hasattr(response, 'content') else str(response)
             raw_text = _clean_think_tags(raw_text)
 
             action = self._parse_action(raw_text)
             return action
         except Exception as e:
-            logger.warning(f"Think阶段失败: {e}, 回退到generate")
+            logger.warning(f"JSON模式Think失败: {e}, 回退到generate")
             return Action(type="generate", input={}, reasoning=f"思考失败: {str(e)}")
+
+    def _build_think_prompt(self, state: Dict) -> str:
+        """
+        构建Think阶段的系统提示词（Function Calling模式）
+
+        使用Function Calling时，工具列表由bind_tools提供，
+        提示词只需指导决策逻辑，无需重复列出工具详情。
+
+        参数:
+            state: 当前状态
+
+        返回:
+            系统提示词字符串
+        """
+        return f"""你是一个智能AI助手，通过观察-思考-行动的循环来回答用户问题。
+
+## 决策规则
+
+根据当前状态选择最合适的行动：
+- 如果还没有检索过且需要查找信息，优先检索知识库（retrieve）
+- 如果检索结果不够好，可以改写查询重新检索（query_rewrite）
+- 如果知识库信息不足或需要实时数据，搜索互联网（web_search）
+- 如果需要执行特定操作，调用外部工具（tool_call）
+- 如果已收集到足够信息，生成回答（generate）
+- 如果回答已经完整且准确，结束（finish）
+
+## 当前状态
+
+- 问题: {state['question']}
+- 已执行步骤: {state['current_step']}
+- 已有信息: {self._summarize_information(state)}
+- 行动历史: {self._format_action_history(state)}"""
 
     def _should_skip_think(self, state: Dict, step: int) -> Optional[Action]:
         """
-        快速路径判断（优化B）：对确定性步骤跳过LLM Think调用
+        快速路径判断（仅限首步）
 
-        典型场景：
-        - 首步且无缓存：直接检索，不需要LLM决策
-        - 已有检索结果但未生成：直接生成，不需要LLM决策
+        仅在首步且无任何信息时跳过LLM Think调用，
+        后续步骤一律由LLM自主决策，确保Agent的智能性。
+        移除了"已有检索结果直接生成"的快捷路径，
+        让Agent能根据检索质量自主决定下一步（生成/改写/搜索等）。
 
         参数:
             state: 当前状态
@@ -397,7 +565,7 @@ class ReActAgent:
         返回:
             如果可以跳过Think，返回预定的Action；否则返回None需要LLM决策
         """
-        # 首步且无检索结果：直接检索
+        # 首步且无检索结果：直接检索（唯一允许跳过Think的场景）
         if step == 0 and not state.get("retrieved_docs"):
             return Action(
                 type="retrieve",
@@ -405,22 +573,16 @@ class ReActAgent:
                 reasoning="首步直接检索，跳过LLM决策"
             )
 
-        # 已有检索结果（≥2篇）且未生成回答：直接生成
-        if state.get("retrieved_docs") and len(state["retrieved_docs"]) >= 2 and not state.get("generation"):
-            return Action(
-                type="generate",
-                input={},
-                reasoning="已有充足检索结果，直接生成回答"
-            )
-
+        # 后续步骤：由LLM自主决策
         return None
 
     def _parse_action(self, raw_text: str) -> Action:
         """
-        从LLM输出中解析行动
+        从LLM输出中解析行动（改进版：支持嵌套JSON）
 
-        LLM输出可能包含think标签、多余文本等，
-        需要提取其中的JSON部分并解析为Action。
+        使用括号匹配算法提取JSON，替代无法处理嵌套结构的正则表达式。
+        原正则r"\\{[^{}]*\\}"无法匹配action_input中包含嵌套对象的场景，
+        如tool_call的args参数。括号匹配算法正确处理所有嵌套层级。
 
         参数:
             raw_text: LLM的原始输出文本
@@ -428,13 +590,14 @@ class ReActAgent:
         返回:
             解析后的Action对象
         """
-        json_match = re.search(r"\{[^{}]*\}", raw_text, re.DOTALL)
-        if not json_match:
+        json_str = self._extract_json(raw_text)
+
+        if not json_str:
             logger.warning(f"无法从LLM输出中提取JSON: {raw_text[:200]}")
             return Action(type="generate", input={}, reasoning="无法解析行动，直接生成")
 
         try:
-            result = json.loads(json_match.group())
+            result = json.loads(json_str)
             action_type = result.get("action", "generate")
             action_input = result.get("action_input", {})
             reasoning = result.get("thought", "")
@@ -448,6 +611,48 @@ class ReActAgent:
         except json.JSONDecodeError as e:
             logger.warning(f"JSON解析失败: {e}, 原始文本: {raw_text[:200]}")
             return Action(type="generate", input={}, reasoning="JSON解析失败，直接生成")
+
+    def _extract_json(self, text: str) -> Optional[str]:
+        """
+        从文本中提取最外层JSON对象（支持嵌套结构）
+
+        使用括号匹配算法，正确处理嵌套的JSON对象和字符串内的花括号。
+        替代原来的正则r"\\{[^{}]*\\}"，该正则无法匹配嵌套JSON。
+
+        参数:
+            text: 包含JSON的文本
+
+        返回:
+            提取到的JSON字符串，未找到返回None
+        """
+        stack = []
+        start = None
+        in_string = False
+        escape = False
+
+        for i, c in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if c == '\\' and in_string:
+                escape = True
+                continue
+            if c == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == '{':
+                if not stack:
+                    start = i
+                stack.append(c)
+            elif c == '}':
+                if stack:
+                    stack.pop()
+                    if not stack and start is not None:
+                        return text[start:i + 1]
+
+        return None
 
     async def _act(self, action: Action, state: Dict) -> ActionResult:
         """

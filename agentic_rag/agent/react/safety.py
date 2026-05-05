@@ -195,8 +195,10 @@ class HallucinationGuard:
         """
         检测是否重复执行相同行动
 
-        连续2次以上执行相同类型的行动视为重复，
+        连续3次以上执行相同类型的行动视为重复，
         这通常是Agent陷入局部循环的信号。
+        阈值从2调整为3，给Agent更多探索空间，
+        允许"检索→改写→再检索"这种合理的两步同类操作。
 
         参数:
             action: 当前行动
@@ -216,14 +218,16 @@ class HallucinationGuard:
             else:
                 break
 
-        return same_type_count >= 2
+        return same_type_count >= 3
 
     def _has_unused_docs(self, state: dict) -> bool:
         """
         检查是否有未使用的检索结果
 
-        如果已经有3篇以上检索文档但还没生成过回答，
+        如果已经有6篇以上检索文档但还没生成过回答，
         说明Agent在浪费资源重复检索，应该先利用已有信息。
+        阈值从3调整为6，允许Agent进行多轮检索积累信息，
+        而不是在仅有3篇文档时就强制生成。
 
         参数:
             state: 当前状态
@@ -233,4 +237,4 @@ class HallucinationGuard:
         """
         retrieved = state.get("retrieved_docs", [])
         has_generation = bool(state.get("generation"))
-        return len(retrieved) >= 3 and not has_generation
+        return len(retrieved) >= 6 and not has_generation
