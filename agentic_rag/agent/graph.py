@@ -39,7 +39,9 @@ from .nodes import (
     reflection_node,
     web_search_node,
     should_skip_evaluation,
+    _build_context_parts,
 )
+from ..execution.parallel_executor import ParallelExecutor
 from .edges import (
     route_after_intent,
     route_after_evaluation,
@@ -124,6 +126,16 @@ class AgenticRAGGraph:
             self._react_agent = None
             self.graph = self._build_graph()
             logger.info("已启用DAG工作流模式")
+
+        # 初始化并行执行器（优化H：最大化并行执行）
+        self._parallel_executor = ParallelExecutor(
+            vectorstore=vectorstore,
+            reranker=reranker,
+            short_term_memory=short_term_memory,
+            long_term_memory=long_term_memory,
+            web_search_tool=tools.get("duckduckgo"),
+        )
+        logger.info("并行执行器初始化完成")
 
     def _build_graph(self) -> StateGraph[AgentState]:
         """
@@ -816,3 +828,486 @@ class AgenticRAGGraph:
                 state["memory_context"] = existing_context + memory_contents
         except Exception as e:
             logger.warning(f"搜索长期记忆失败: {e}")
+
+    async def fast_stream_invoke(
+        self,
+        question: str,
+        session_id: str = None,
+        user_id: str = None,
+        **kwargs
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        快速流式执行Agent（核心优化：首token时间<2s）
+
+        与stream_invoke的根本区别：
+        - stream_invoke: graph.astream()节点级流式，generation节点内部llm.invoke()阻塞
+          → 用户必须等generation节点完成才能看到第一个token
+        - fast_stream_invoke: 手动执行前置节点，到达generation时直接用llm.astream()
+          → 用户在LLM开始生成时立即看到第一个token
+
+        架构变化：
+        1. 前置阶段（intent→retrieval→rerank）手动执行，不走graph
+        2. generation阶段用llm.astream()真流式，不走graph的generation_node
+        3. evaluation/CRAG/reflection移到后台异步执行，不阻塞用户
+        4. 记忆保存移到后台异步执行
+
+        参数:
+            question: 用户问题
+            session_id: 会话ID
+            user_id: 用户ID
+
+        产出:
+            Dict[str, Any]: 流式事件
+                - type="status": 状态更新
+                - type="token": 生成内容的token级流式（真正的逐token输出）
+                - type="sources": 检索到的文档
+                - type="done": 完成信号
+        """
+        settings = get_settings()
+        state = self._create_initial_state(question, kwargs)
+
+        # ===== 阶段1: 并行加载记忆（与原stream_invoke相同）=====
+        memory_tasks = []
+        if self.short_term_memory and session_id:
+            memory_tasks.append(self._load_short_term_memory_stream(state, session_id))
+        if self.long_term_memory and user_id:
+            memory_tasks.append(self._search_long_term_memory_stream(state, user_id, question))
+        if memory_tasks:
+            await asyncio.gather(*memory_tasks)
+
+        # ===== 快速路径: 生成缓存检查 =====
+        if settings.generation_cache_enabled:
+            cached_gen = self.gen_cache.get(question, None)
+            if cached_gen:
+                cached_response = cached_gen.get("response", "")
+                logger.info(f"快速流式-生成缓存命中: {question[:50]}...")
+                for i in range(0, len(cached_response), 50):
+                    chunk = cached_response[i:i+50]
+                    if chunk:
+                        yield {
+                            "type": "token",
+                            "content": chunk,
+                            "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
+                        }
+                        await asyncio.sleep(0.05)
+                asyncio.create_task(self._save_memories(
+                    {"generation": cached_response, "intent": cached_gen.get("intent", "unknown")},
+                    question, session_id, user_id
+                ))
+                yield {
+                    "type": "done",
+                    "content": "回答生成完成(缓存)",
+                    "data": {
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "cached": True,
+                        "intent": cached_gen.get("intent", "unknown"),
+                        "reflection_count": 0,
+                        "gen_cache_hit": True,
+                    }
+                }
+                return
+
+        # ===== 阶段2: 意图识别+查询改写（1次LLM调用）=====
+        yield {
+            "type": "status",
+            "content": "正在分析问题...",
+            "data": {"stage": "intent_classification"}
+        }
+        intent_result = intent_and_rewrite_node(state, self.llm, self.intent_cache)
+        state.update(intent_result)
+        intent = state.get("intent", "factual")
+        yield {
+            "type": "status",
+            "content": f"意图识别完成: {intent}",
+            "data": {"stage": "intent_classification", "intent": intent}
+        }
+
+        # 缓存二次检查（基于意图）
+        if settings.generation_cache_enabled:
+            cached_gen = self.gen_cache.get(question, intent)
+            if cached_gen:
+                cached_response = cached_gen.get("response", "")
+                logger.info(f"快速流式-生成缓存命中(意图过滤): {question[:50]}...")
+                for i in range(0, len(cached_response), 50):
+                    chunk = cached_response[i:i+50]
+                    if chunk:
+                        yield {
+                            "type": "token",
+                            "content": chunk,
+                            "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
+                        }
+                        await asyncio.sleep(0.05)
+                asyncio.create_task(self._save_memories(
+                    {"generation": cached_response, "intent": intent},
+                    question, session_id, user_id
+                ))
+                yield {
+                    "type": "done",
+                    "content": "回答生成完成(缓存)",
+                    "data": {
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "cached": True,
+                        "intent": intent,
+                        "reflection_count": 0,
+                        "gen_cache_hit": True,
+                    }
+                }
+                return
+
+        # ===== 阶段3: 根据意图执行不同路径 =====
+        if intent == "tool_call":
+            yield {
+                "type": "status",
+                "content": "正在调用工具...",
+                "data": {"stage": "tool_call"}
+            }
+            tool_result = tool_call_node(state, self.llm, self.tools)
+            state.update(tool_result)
+
+        elif intent in ("factual", "multi_hop", "reasoning"):
+            # 检索路径
+            yield {
+                "type": "status",
+                "content": "正在检索相关文档...",
+                "data": {"stage": "retrieval"}
+            }
+            retrieval_result = parallel_retrieval_node(state, self.vectorstore)
+            state.update(retrieval_result)
+
+            yield {
+                "type": "status",
+                "content": "正在优化文档排序...",
+                "data": {"stage": "rerank"}
+            }
+            rerank_result = rerank_node(state, self.reranker)
+            state.update(rerank_result)
+
+            if state.get("reranked_docs"):
+                docs_info = [
+                    {
+                        "content": doc.page_content[:200] + "...",
+                        "metadata": doc.metadata,
+                        "score": doc.metadata.get("score")
+                    }
+                    for doc in state["reranked_docs"][:3]
+                ]
+                yield {
+                    "type": "sources",
+                    "content": "检索到相关文档",
+                    "data": {"documents": docs_info}
+                }
+
+        # summary意图直接跳到生成
+
+        # ===== 阶段4: 真流式生成（核心优化！）=====
+        yield {
+            "type": "status",
+            "content": "正在生成回答...",
+            "data": {"stage": "generation"}
+        }
+
+        context_parts = _build_context_parts(
+            state.get("memory_context", []),
+            state.get("conversation_history", []),
+            state.get("reranked_docs", []),
+            state.get("search_results", []),
+            state.get("tool_results", {}),
+            state.get("tool_call_failed", False),
+            settings
+        )
+        context = "\n".join(context_parts) if context_parts else "(无相关上下文)"
+        prompt = self.prompt_template.format(context=context, question=question)
+
+        full_text = []
+        async for chunk in self.llm.astream(prompt):
+            token = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            if token:
+                full_text.append(token)
+                yield {
+                    "type": "token",
+                    "content": token,
+                    "data": {}
+                }
+
+        generation = "".join(full_text)
+        generation = _clean_think_tags(generation)
+        state["generation"] = generation
+
+        # 写入生成缓存
+        if settings.generation_cache_enabled:
+            self.gen_cache.set(
+                question,
+                generation,
+                intent=None,
+                metadata={"cached_at": time.time(), "actual_intent": state.get("intent")}
+            )
+
+        # ===== 阶段5: 后台异步执行评估+记忆保存（不阻塞用户）=====
+        asyncio.create_task(
+            self._background_post_processing(state, question, session_id, user_id)
+        )
+
+        # ===== 完成 =====
+        think_pattern = r'<think\b[^>]*>(.*?)</think\s*>'
+        think_matches = re.findall(think_pattern, "".join(full_text), re.DOTALL)
+        think_content = [match.strip() for match in think_matches if match.strip()]
+
+        yield {
+            "type": "done",
+            "content": "回答生成完成",
+            "data": {
+                "session_id": session_id,
+                "user_id": user_id,
+                "intent": state.get("intent"),
+                "reflection_count": 0,
+                "tools_used": list(state.get("tool_results", {}).keys()),
+                "think_content": think_content,
+                "has_think": bool(think_content),
+                "fast_stream": True,
+            }
+        }
+
+    async def _background_post_processing(
+        self,
+        state: Dict,
+        question: str,
+        session_id: str = None,
+        user_id: str = None
+    ):
+        """
+        后台异步后处理（不阻塞用户感知的响应时间）
+
+        包含：
+        1. 轻量级评估（用于日志/监控，不影响用户）
+        2. 记忆保存（短期+长期）
+        3. CRAG判断（低置信度时记录日志，但不重新生成）
+
+        为什么可以后台执行：
+        - 评估结果不影响已输出的答案
+        - 记忆保存是写操作，与读操作无关
+        - CRAG的重新生成在快速流式模式下被禁用，
+          因为"先给用户一个答案"比"给用户一个完美答案"更重要
+        """
+        try:
+            # 轻量级评估（无LLM调用，纯规则计算）
+            evaluation_result = evaluation_node(state, self.llm)
+            state.update(evaluation_result)
+
+            confidence_level = state.get("confidence_level", "high")
+            overall_score = state.get("evaluation", {}).get("overall_score", 0.5)
+            logger.info(
+                f"后台评估完成: confidence={confidence_level}, score={overall_score:.3f}, "
+                f"intent={state.get('intent')}"
+            )
+
+            # 保存记忆
+            await self._save_memories(state, question, session_id, user_id)
+
+        except Exception as e:
+            logger.warning(f"后台后处理失败: {e}")
+
+    async def ultra_fast_stream_invoke(
+        self,
+        question: str,
+        session_id: str = None,
+        user_id: str = None,
+        **kwargs
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        超快速流式执行（终极并行优化）
+        
+        与 fast_stream_invoke 的区别：
+        - fast_stream_invoke: 手动顺序执行前置节点
+        - ultra_fast_stream_invoke: 使用 ParallelExecutor 并行 Memory + Retrieval
+        
+        优化点：
+        1. Memory 加载与 Retrieval 完全并行（无等待）
+        2. Vector + BM25 混合检索并行
+        3. Multi-query 检索异步并发
+        4. 后台 evaluation + memory save
+        
+        参数:
+            question: 用户问题
+            session_id: 会话 ID
+            user_id: 用户 ID
+            
+        产出:
+            Dict[str, Any]: 流式事件
+        """
+        settings = get_settings()
+        
+        # ===== 阶段1: 意图识别 + 查询改写 =====
+        initial_state = self._create_initial_state(question, kwargs)
+        
+        yield {
+            "type": "status",
+            "content": "正在分析问题...",
+            "data": {"stage": "intent_classification"}
+        }
+        intent_result = intent_and_rewrite_node(initial_state, self.llm, self.intent_cache)
+        initial_state.update(intent_result)
+        intent = initial_state.get("intent", "factual")
+        rewritten_queries = initial_state.get("rewritten_queries", [question])
+        
+        yield {
+            "type": "status",
+            "content": f"意图识别完成: {intent}",
+            "data": {"stage": "intent_classification", "intent": intent}
+        }
+        
+        # ===== 快速路径：生成缓存检查 =====
+        if settings.generation_cache_enabled:
+            cached_gen = self.gen_cache.get(question, intent)
+            if cached_gen:
+                cached_response = cached_gen.get("response", "")
+                logger.info(f"超快速流式-缓存命中: {question[:50]}...")
+                
+                for i in range(0, len(cached_response), 50):
+                    chunk = cached_response[i:i+50]
+                    if chunk:
+                        yield {
+                            "type": "token",
+                            "content": chunk,
+                            "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
+                        }
+                        await asyncio.sleep(0.05)
+                
+                # 后台保存记忆
+                asyncio.create_task(
+                    self._save_memories(
+                        {"generation": cached_response, "intent": intent},
+                        question, session_id, user_id
+                    )
+                )
+                
+                yield {
+                    "type": "done",
+                    "content": "回答生成完成(缓存)",
+                    "data": {
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "cached": True,
+                        "intent": intent,
+                        "gen_cache_hit": True,
+                        "ultra_fast": True,
+                    }
+                }
+                return
+        
+        # ===== 阶段2: 并行执行 Memory + Retrieval + WebSearch =====
+        parallel_result = None
+        if intent in ("tool_call",):
+            # 工具调用路径：直接执行工具
+            yield {
+                "type": "status",
+                "content": "正在调用工具...",
+                "data": {"stage": "tool_call"}
+            }
+            tool_result = tool_call_node(initial_state, self.llm, self.tools)
+            initial_state.update(tool_result)
+            
+            state_for_gen = initial_state
+        else:
+            # 检索路径：并行加载所有数据
+            yield {
+                "type": "status",
+                "content": "并行加载记忆和检索文档...",
+                "data": {"stage": "parallel_loading"}
+            }
+            
+            parallel_result = await self._parallel_executor.execute_full_pipeline(
+                question=question,
+                intent=intent,
+                rewritten_queries=rewritten_queries,
+                session_id=session_id,
+                user_id=user_id,
+            )
+            
+            # 合并结果到状态
+            state_for_gen = initial_state.copy()
+            state_for_gen["retrieved_docs"] = parallel_result.retrieved_docs
+            state_for_gen["reranked_docs"] = parallel_result.retrieved_docs  # 已经是 reranked
+            state_for_gen["memory_context"] = parallel_result.memory_context
+            state_for_gen["conversation_history"] = parallel_result.conversation_history
+            state_for_gen["search_results"] = parallel_result.search_results
+            
+            yield {
+                "type": "status",
+                "content": f"检索完成: {len(state_for_gen['reranked_docs'])} 条文档",
+                "data": {
+                    "stage": "retrieval_done",
+                    "doc_count": len(state_for_gen["reranked_docs"]),
+                    "parallel_times": parallel_result.execution_times,
+                }
+            }
+        
+        # ===== 阶段3: 真流式生成 =====
+        yield {
+            "type": "status",
+            "content": "正在生成回答...",
+            "data": {"stage": "generation"}
+        }
+        
+        context_parts = _build_context_parts(
+            state_for_gen.get("memory_context", []),
+            state_for_gen.get("conversation_history", []),
+            state_for_gen.get("reranked_docs", []),
+            state_for_gen.get("search_results", []),
+            state_for_gen.get("tool_results", {}),
+            state_for_gen.get("tool_call_failed", False),
+            settings
+        )
+        context = "\n".join(context_parts) if context_parts else "(无相关上下文)"
+        prompt = self.prompt_template.format(context=context, question=question)
+        
+        full_text = []
+        async for chunk in self.llm.astream(prompt):
+            token = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            if token:
+                full_text.append(token)
+                yield {
+                    "type": "token",
+                    "content": token,
+                    "data": {}
+                }
+        
+        generation = "".join(full_text)
+        generation = _clean_think_tags(generation)
+        state_for_gen["generation"] = generation
+        
+        # 写入缓存
+        if settings.generation_cache_enabled:
+            self.gen_cache.set(
+                question,
+                generation,
+                intent=intent,
+                metadata={"cached_at": time.time(), "actual_intent": intent}
+            )
+        
+        # ===== 阶段4: 后台异步后处理 =====
+        asyncio.create_task(
+            self._background_post_processing(state_for_gen, question, session_id, user_id)
+        )
+        
+        # ===== 完成 =====
+        think_pattern = r'<think\b[^>]*>(.*?)</think\s*>'
+        think_matches = re.findall(think_pattern, "".join(full_text), re.DOTALL)
+        think_content = [match.strip() for match in think_matches if match.strip()]
+        
+        yield {
+            "type": "done",
+            "content": "回答生成完成",
+            "data": {
+                "session_id": session_id,
+                "user_id": user_id,
+                "intent": state_for_gen.get("intent"),
+                "tools_used": list(state_for_gen.get("tool_results", {}).keys()),
+                "think_content": think_content,
+                "has_think": bool(think_content),
+                "ultra_fast": True,
+                "parallel_execution": True,
+                "execution_times": parallel_result.execution_times if parallel_result else {},
+            }
+        }

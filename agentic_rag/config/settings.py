@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     # Agent模式配置
     agent_mode: str = "react"  # Agent执行模式: "react"(ReAct Agent) 或 "dag"(传统DAG工作流)
 
+    # 快速流式配置（响应速度优化）
+    fast_stream_enabled: bool = True  # 是否启用快速流式模式（DAG模式下use_fast_path=True时生效）
+    fast_stream_default: bool = True  # 默认是否使用快速流式路径（影响API的use_fast_path默认值）
+
     class Config:
         env_file = ".env"
         case_sensitive = False # 不区分大小写

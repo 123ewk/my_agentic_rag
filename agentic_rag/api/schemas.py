@@ -47,7 +47,7 @@ class QueryRequest(BaseModel):
         examples=["deepseek-v3.2", "MiniMax-M2.6", "glm-4"]
     )
     use_tools: bool = Field(True, description="是否使用工具")
-    use_fast_path: bool = Field(False, description="快速路径模式(缓存命中时跳过评估,响应更快)")
+    use_fast_path: bool = Field(True, description="快速流式模式(真流式输出+后台评估,首token<2s)")
     max_reflection: int = Field(2, ge=0, le=5, description="最大反思次数")
     temperature: float = Field(0.7, ge=0.0, le=2.0, description="温度参数")
     mode: Optional[str] = Field(

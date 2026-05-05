@@ -714,9 +714,16 @@ async def generate_stream_response(
     """
     流式响应生成器
     
-    支持两种Agent模式的事件格式：
-    - ReAct模式: thought/action/observation/token/done 事件
-    - DAG模式: status/chunk/sources/metrics/done 事件
+    支持四种执行路径：
+    1. 超快速路径（ultra_fast）: 使用ultra_fast_stream_invoke（最大化并行）
+       - Memory + Retrieval 完全并行
+       - 首 token 时间最优
+    2. 快速流式路径（use_fast_path=True）: 使用fast_stream_invoke
+       - 前置节点手动执行，generation用llm.astream()真流式
+       - evaluation/CRAG/reflection后台异步执行
+       - 首token时间<2s，总体感知响应<5s
+    3. ReAct模式: 使用ReActAgent的stream_run（token级流式）
+    4. DAG模式: 使用graph.astream() + generation_node_stream（节点级流式）
     
     参数：
         agent: Agent实例
@@ -738,7 +745,73 @@ async def generate_stream_response(
                 llm = get_llm_for_model(model_name)
                 agent.llm = llm
             logger.info(f"已切换到模型: {model_name}")
-        
+
+        # 超快速路径：最大化并行（最优性能）
+        if hasattr(agent, 'ultra_fast_stream_invoke') and use_fast_path and not agent.use_react:
+            async for event in agent.ultra_fast_stream_invoke(
+                question=question,
+                session_id=session_id,
+                user_id=user_id,
+                use_tools=use_tools,
+                temperature=temperature,
+                max_reflection_steps=max_reflection,
+            ):
+                event_type = event.get("type", "unknown")
+                event_content = event.get("content", "")
+                event_data = event.get("data", {})
+
+                if event_type == "token":
+                    sse_data = {
+                        "type": "token",
+                        "content": event_content,
+                    }
+                else:
+                    sse_data = {
+                        "type": event_type,
+                        "content": event_content,
+                        **event_data
+                    }
+
+                yield f"data: {json.dumps(sse_data, ensure_ascii=False, cls=DateTimeEncoder)}\n\n".encode('utf-8')
+
+                if event_type == "done":
+                    yield b"event: done\ndata: [DONE]\n\n"
+            return
+
+        # 快速流式路径：DAG模式下使用fast_stream_invoke
+        if use_fast_path and not agent.use_react:
+            async for event in agent.fast_stream_invoke(
+                question=question,
+                session_id=session_id,
+                user_id=user_id,
+                use_tools=use_tools,
+                temperature=temperature,
+                max_reflection_steps=max_reflection,
+            ):
+                event_type = event.get("type", "unknown")
+                event_content = event.get("content", "")
+                event_data = event.get("data", {})
+
+                # token事件直接转发，实现真正的逐token流式
+                if event_type == "token":
+                    sse_data = {
+                        "type": "token",
+                        "content": event_content,
+                    }
+                else:
+                    sse_data = {
+                        "type": event_type,
+                        "content": event_content,
+                        **event_data
+                    }
+
+                yield f"data: {json.dumps(sse_data, ensure_ascii=False, cls=DateTimeEncoder)}\n\n".encode('utf-8')
+
+                if event_type == "done":
+                    yield b"event: done\ndata: [DONE]\n\n"
+            return
+
+        # 标准路径
         async for event in agent.stream_invoke(
             question=question,
             session_id=session_id,
