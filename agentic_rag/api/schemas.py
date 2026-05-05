@@ -50,6 +50,11 @@ class QueryRequest(BaseModel):
     use_fast_path: bool = Field(False, description="快速路径模式(缓存命中时跳过评估,响应更快)")
     max_reflection: int = Field(2, ge=0, le=5, description="最大反思次数")
     temperature: float = Field(0.7, ge=0.0, le=2.0, description="温度参数")
+    mode: Optional[str] = Field(
+        None,
+        description="Agent执行模式: 'react'(ReAct Agent) 或 'dag'(传统DAG工作流)，不指定则使用系统默认配置",
+        examples=["react", "dag"]
+    )
     
     @field_validator('question')
     def validate_question_not_empty(cls, v):

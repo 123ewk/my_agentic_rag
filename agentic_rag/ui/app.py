@@ -13,7 +13,10 @@ from dotenv import load_dotenv
 
 def get_available_models() -> List[str]:
     """
-    从环境变量中读取可用的模型列表
+    从后端API获取可用的模型列表
+    
+    优先从后端API动态获取，失败时回退到环境变量配置。
+    不再硬编码模型名，确保前后端模型列表一致。
     
     返回：
         可用模型名称列表
@@ -26,10 +29,10 @@ def get_available_models() -> List[str]:
     if os.getenv("MINIMAX_API_KEY") and os.getenv("MINIMAX_MODEL"):
         models.append(os.getenv("MINIMAX_MODEL"))
     if os.getenv("QWEN_API_KEY"):
-        qwen_model = os.getenv("QWEN_MODEL", "deepseek-v3.2")
+        qwen_model = os.getenv("QWEN_MODEL", "qwen3.5-plus")
         models.append(qwen_model)
     
-    return models if models else ["deepseek-v3.2"]
+    return models if models else ["qwen3.5-plus"]
 
 class APIClient:
     """
@@ -389,7 +392,7 @@ def render_sidebar() -> Dict[str, Any]:
                 st.session_state.api_client = APIClient(
                     base_url=api_base_url,
                     api_key=api_key,
-                    timeout=60,
+                    timeout=180,
                     use_streaming=use_streaming
                 )
                 st.session_state.use_streaming = use_streaming
@@ -407,7 +410,7 @@ def render_sidebar() -> Dict[str, Any]:
         
         st.subheader("🤖 模型参数")
         available_models = get_available_models()
-        current_model = st.session_state.get("model_name", available_models[0] if available_models else "deepseek-chat")
+        current_model = st.session_state.get("model_name", available_models[0] if available_models else "qwen3.5-plus")
         try:
             default_index = available_models.index(current_model)
         except ValueError:
@@ -698,6 +701,31 @@ def handle_stream_query(
             event_type = event.get("type", "")
 
             if event_type == "status":
+                status_msg = event.get("content", "")
+                if status_msg:
+                    thinking_placeholder.info(f"⏳ {status_msg}")
+                continue
+
+            elif event_type == "thought":
+                thought_content_text = event.get("content", "")
+                if thought_content_text:
+                    thinking_placeholder.info(f"🔍 **观察:** {thought_content_text[:300]}▌")
+                continue
+
+            elif event_type == "action":
+                action_data = event.get("data", {})
+                action_type = action_data.get("action_type", "")
+                reasoning = action_data.get("reasoning", "")
+                if reasoning:
+                    thinking_placeholder.info(f"🎯 **决策:** {reasoning[:200]}")
+                continue
+
+            elif event_type == "observation":
+                obs_content = event.get("content", "")
+                action_data = event.get("data", {})
+                success = action_data.get("success", True)
+                icon = "✅" if success else "❌"
+                thinking_placeholder.info(f"{icon} **结果:** {obs_content[:200]}")
                 continue
 
             elif event_type == "chunk" or event_type == "token":

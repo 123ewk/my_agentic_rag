@@ -38,6 +38,8 @@ def tool_call(state: AgentState, llm: BaseChatModel, tools: Dict[str, BaseTool])
     """
     生产级工具调用节点(LLM驱动版)
     自动决定工具选择、参数解析、错误处理
+    
+    改进：设置tool_call_failed标记，让generation节点感知工具调用失败
     """
     question = state["question"]
     tool_results = {}
@@ -49,7 +51,7 @@ def tool_call(state: AgentState, llm: BaseChatModel, tools: Dict[str, BaseTool])
     ])
 
     # --- 步骤2：调用LLM，获取工具调用请求 ---
-    parser = PydanticOutputParser(pydantic_object=ToolCallRequests) # 解析器，将LLM输出解析为ToolCallRequests对象
+    parser = PydanticOutputParser(pydantic_object=ToolCallRequests)
     chain = TOOL_CALL_PROMPT | llm | parser
 
     try:
@@ -58,27 +60,32 @@ def tool_call(state: AgentState, llm: BaseChatModel, tools: Dict[str, BaseTool])
             "tools_desc": tools_desc
         })
     except Exception as e:
-        # 错误兜底：解析失败时不调用任何工具，避免流程崩溃
+        # 错误兜底：解析失败时不调用任何工具，设置失败标记
         logger.error("工具调用节点解析失败：{}", str(e))
-        return {"tool_results": {}}
+        return {"tool_results": {}, "tool_call_failed": True}
 
     # --- 步骤3：执行工具调用 ---
+    has_failure = False
     for call in response.calls:
         tool_name = call.name
         tool_params = call.parameters
 
         # 工具存在性校验
         if tool_name not in tools:
+            logger.warning(f"LLM请求调用不存在的工具: {tool_name}")
+            has_failure = True
             continue
         
         tool = tools[tool_name]
         try:
-            # 调用工具（自动处理参数）
             result = tool.invoke(tool_params)
             tool_results[tool_name] = result
         except Exception as e:
-            # 单个工具调用失败不影响整体流程
+            # 单个工具调用失败不影响整体流程，但标记失败
             logger.error("工具调用节点调用工具{}失败：{}", tool_name, str(e))
             tool_results[tool_name] = f"工具调用失败：{str(e)}"
+            has_failure = True
 
-    return {"tool_results": tool_results}
+    # 如果没有任何工具成功执行，标记失败
+    tool_call_failed = has_failure and len(tool_results) == 0
+    return {"tool_results": tool_results, "tool_call_failed": tool_call_failed}

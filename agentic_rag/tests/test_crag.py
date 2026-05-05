@@ -8,28 +8,6 @@ from langchain_core.documents import Document
 from agentic_rag.agent.nodes import web_search_node
 
 
-  def test_high_confidence_with_high_overall_score(self):
-      """测试高置信度场景：evaluation分数高，不触发搜索"""
-      state = {
-          "question": "什么是Python?",
-          "reranked_docs": [
-              Document(page_content="Python是一种编程语言", metadata={"score": 0.9}),
-              Document(page_content="Python由Guido van Rossum创建", metadata={"score": 0.85}),
-              Document(page_content="Python语法简洁易读", metadata={"score": 0.8})
-          ],
-          "evaluation": {
-              "faithfulness": 0.8,
-              "answer_relevancy": 0.9,
-              "context_precision": 0.8,
-              "overall_score": 0.85
-          }
-      }
-      
-      # 高置信度不触发搜索，直接验证分数判断逻辑
-      assert state["evaluation"]["overall_score"] >= 0.7
-      assert state["evaluation"]["overall_score"] >= 0.3
-
-
 class TestWebSearchNode:
     """网络搜索节点测试"""
 
@@ -39,7 +17,7 @@ class TestWebSearchNode:
         mock_search.invoke.return_value = """1. Python官方网站
    Python官方文档和教程
    来源: https://python.org
-   
+
 2. Python教程
    免费的Python学习资源
    来源: https://python-tutorial.com"""
@@ -85,13 +63,31 @@ class TestWebSearchNode:
 class TestCRAGIntegration:
     """CRAG集成测试"""
 
+    def test_high_confidence_with_high_overall_score(self):
+        """测试高置信度场景：evaluation分数高，不触发搜索"""
+        state = {
+            "question": "什么是Python?",
+            "reranked_docs": [
+                Document(page_content="Python是一种编程语言", metadata={"score": 0.9}),
+                Document(page_content="Python由Guido van Rossum创建", metadata={"score": 0.85}),
+                Document(page_content="Python语法简洁易读", metadata={"score": 0.8})
+            ],
+            "evaluation": {
+                "faithfulness": 0.8,
+                "answer_relevancy": 0.9,
+                "context_precision": 0.8,
+                "overall_score": 0.85
+            }
+        }
+        
+        assert state["evaluation"]["overall_score"] >= 0.7
+        assert state["evaluation"]["overall_score"] >= 0.3
+
     def test_confidence_score_calculation(self):
         """测试置信度得分计算"""
         from agentic_rag.config.settings import Settings
         
-        # 模拟不同场景的置信度计算
         test_cases = [
-            # (文档数, 平均相关性, 回答长度, 期望置信度等级)
             (3, 0.9, 500, "high"),
             (0, 0.0, 0, "low"),
             (1, 0.4, 100, "low"),
@@ -99,5 +95,4 @@ class TestCRAGIntegration:
         ]
         
         for doc_count, avg_relevance, answer_len, expected_level in test_cases:
-            # 简单验证：置信度等级应该符合预期范围
             assert expected_level in ["high", "medium", "low"]

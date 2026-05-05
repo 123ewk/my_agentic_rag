@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     is_production: bool = True
 
     # LLM 配置
-    llm_name: str = "Qwen3.5-plus"
+    llm_name: str = os.getenv("QWEN_MODEL", "qwen3.5-plus")
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
     qwen_api_key: str = os.getenv("QWEN_API_KEY", "")
@@ -64,8 +64,8 @@ class Settings(BaseSettings):
     short_term_memory_k: int = 10
     long_term_memory_k: int = 3
     
-    # 反思配置
-    max_reflection_steps: int = 2
+    # 反思配置（优化F：默认关闭reflection，仅在用户显式请求时启用）
+    max_reflection_steps: int = 0
     
     # API配置
     api_port: int = 8000
@@ -97,6 +97,9 @@ class Settings(BaseSettings):
     crag_confidence_threshold_high: float = 0.7  # 高置信度阈值(>=此值认为是高置信度)
     crag_confidence_threshold_low: float = 0.3  # 低置信度阈值(<此值触发网络搜索)
 
+    # Agent模式配置
+    agent_mode: str = "react"  # Agent执行模式: "react"(ReAct Agent) 或 "dag"(传统DAG工作流)
+
     class Config:
         env_file = ".env"
         case_sensitive = False # 不区分大小写
@@ -122,8 +125,18 @@ class Settings(BaseSettings):
                 "api_key": self.minimax_api_key,
                 "base_url": self.minimax_base_url
             },
-            # Qwen 模型
+            # DeepSeek 模型（通过阿里云百炼调用）
             "deepseek-v3.2": {
+                "api_key": self.qwen_api_key,
+                "base_url": self.qwen_base_url
+            },
+            # Qwen3.5-Plus 模型
+            "qwen3.5-plus": {
+                "api_key": self.qwen_api_key,
+                "base_url": self.qwen_base_url
+            },
+            # Qwen3.6-Plus 模型
+            "qwen3.6-plus": {
                 "api_key": self.qwen_api_key,
                 "base_url": self.qwen_base_url
             },
@@ -145,10 +158,10 @@ class Settings(BaseSettings):
         if self.minimax_api_key and self.minimax_model:
             models.append(self.minimax_model)
         if self.qwen_api_key:
-            qwen_model = os.getenv("QWEN_MODEL", "deepseek-v3.2")
+            qwen_model = os.getenv("QWEN_MODEL", "qwen3.5-plus")
             models.append(qwen_model)
         
-        return models if models else ["deepseek-v3.2"]
+        return models if models else ["qwen3.5-plus"]
 
 
 @lru_cache()  # 缓存装饰器,给函数的返回结果做缓存，避免重复计算，大幅提升性能。

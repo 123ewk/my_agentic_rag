@@ -202,7 +202,8 @@ def create_agent() -> Any:
         tools=tools,
         prompt_template=prompt_template,
         short_term_memory=short_term_memory,
-        long_term_memory=long_term_memory
+        long_term_memory=long_term_memory,
+        use_react=(settings.agent_mode == "react"),
     )
     
     logger.info("Agent实例创建成功")
@@ -417,8 +418,25 @@ class RateLimiter:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.requests = {}  # {client_ip: [timestamp1, timestamp2, ...]}
+        self._last_cleanup = time.time()  # 上次清理时间
+    
+    def _cleanup_expired_ips(self):
+        """清理不再活跃的IP记录，防止内存泄漏"""
+        now = time.time()
+        # 每5分钟清理一次
+        if now - self._last_cleanup < 300:
+            return
+        self._last_cleanup = now
+        
+        expired_ips = [
+            ip for ip, timestamps in self.requests.items()
+            if not timestamps or now - timestamps[-1] > self.window_seconds
+        ]
+        for ip in expired_ips:
+            del self.requests[ip]
     
     async def __call__(self, request: Request):
+        self._cleanup_expired_ips()
         client_ip = request.client.host
         now = time.time()
         
@@ -579,11 +597,37 @@ async def query(
         # 生成session_id
         session_id = request.session_id or str(uuid.uuid4())
         
-        # 如果指定了模型名称，动态更新 agent 的 LLM
+        # 如果指定了模型名称，动态更新 agent 的 LLM（加锁防止并发竞态）
         if request.model_name:
-            llm = get_llm_for_model(request.model_name)
-            agent.llm = llm
+            with _llm_lock:
+                llm = get_llm_for_model(request.model_name)
+                agent.llm = llm
             logger.info(f"[{request_id}] 已切换到模型: {request.model_name}")
+        
+        # 如果指定了Agent模式，动态切换（仅当请求的mode与当前不同时才重建）
+        if request.mode:
+            from agentic_rag.config.settings import get_settings as _get_settings
+            _settings = _get_settings()
+            target_react = (request.mode == "react")
+            if agent.use_react != target_react:
+                agent.use_react = target_react
+                if target_react:
+                    from agentic_rag.agent.react import ReActAgent
+                    agent._react_agent = ReActAgent(
+                        llm=agent.llm,
+                        embeddings=agent.embeddings,
+                        vectorstore=agent.vectorstore,
+                        reranker=agent.reranker,
+                        tools=agent.tools,
+                        prompt_template=agent.prompt_template,
+                        short_term_memory=agent.short_term_memory,
+                        long_term_memory=agent.long_term_memory,
+                    )
+                    logger.info(f"[{request_id}] 动态切换到ReAct模式")
+                else:
+                    agent._react_agent = None
+                    agent.graph = agent._build_graph()
+                    logger.info(f"[{request_id}] 动态切换到DAG模式")
         
         # 记录调用参数
         logger.info(f"[{request_id}] 开始处理查询: question='{request.question[:50]}...', session_id={session_id}")
@@ -606,19 +650,21 @@ async def query(
         
         processing_time = time.time() - start_time
         
-        # 构建响应 - 防御性处理
+        # 构建响应 - 防御性处理（兼容DAG和ReAct两种模式的输出格式）
         tool_results = result.get("tool_results", {})
         if not isinstance(tool_results, dict):
             tool_results = {}
         
+        # ReAct模式的sources在reranked_docs中，DAG模式也在reranked_docs中
+        source_docs = result.get("reranked_docs", []) or result.get("sources", [])
         sources = [
             SourceDocument(
-                content=doc.page_content[:500],
-                metadata=doc.metadata,
-                score=doc.metadata.get("score"),
-                source=doc.metadata.get("source")
+                content=doc.page_content[:500] if hasattr(doc, 'page_content') else str(doc)[:500],
+                metadata=doc.metadata if hasattr(doc, 'metadata') else {},
+                score=doc.metadata.get("score") if hasattr(doc, 'metadata') else None,
+                source=doc.metadata.get("source") if hasattr(doc, 'metadata') else None,
             )
-            for doc in result.get("reranked_docs", [])
+            for doc in source_docs
         ]
         
         answer = result.get("refined_answer") or result.get("generation", "")
@@ -665,6 +711,10 @@ async def generate_stream_response(
     """
     流式响应生成器
     
+    支持两种Agent模式的事件格式：
+    - ReAct模式: thought/action/observation/token/done 事件
+    - DAG模式: status/chunk/sources/metrics/done 事件
+    
     参数：
         agent: Agent实例
         question: 用户问题
@@ -677,16 +727,15 @@ async def generate_stream_response(
         use_fast_path: 快速路径模式(缓存命中时跳过评估)
     
     产出：
-        bytes: SSE格式的响应数据:SSE 是一种让服务器能主动向浏览器 / 客户端持续推送数据的技术
+        bytes: SSE格式的响应数据
     """
     try:
-        # 如果指定了模型名称，动态更新 agent 的 LLM
         if model_name:
-            llm = get_llm_for_model(model_name)
-            agent.llm = llm
+            with _llm_lock:
+                llm = get_llm_for_model(model_name)
+                agent.llm = llm
             logger.info(f"已切换到模型: {model_name}")
         
-        # 调用流式invoke方法
         async for event in agent.stream_invoke(
             question=question,
             session_id=session_id,
@@ -696,22 +745,25 @@ async def generate_stream_response(
             max_reflection_steps=max_reflection,
             use_fast_path=use_fast_path
         ):
-            # 将事件转换为SSE格式
             event_type = event.get("type", "unknown")
             event_content = event.get("content", "")
             event_data = event.get("data", {})
             
-            # 构建SSE数据
-            sse_data = {
-                "type": event_type,
-                "content": event_content,
-                **event_data
-            }
+            # ReAct模式的token事件直接转发，实现真正的逐token流式
+            if event_type == "token":
+                sse_data = {
+                    "type": "token",
+                    "content": event_content,
+                }
+            else:
+                sse_data = {
+                    "type": event_type,
+                    "content": event_content,
+                    **event_data
+                }
             
-            # 使用data:前缀，这是SSE的标准格式，使用自定义编码器处理datetime
             yield f"data: {json.dumps(sse_data, ensure_ascii=False, cls=DateTimeEncoder)}\n\n".encode('utf-8')
             
-            # 如果是完成事件，发送一个特殊的标记
             if event_type == "done":
                 yield b"event: done\ndata: [DONE]\n\n"
         
@@ -930,15 +982,28 @@ async def health_check(request: Request):
     """
     components = {}
     
-    # 检查数据库连接
+    # 检查数据库连接（复用Agent已有的短期记忆实例，避免每次创建新连接）
     try:
-        from agentic_rag.memory.short_term import ShortTermMemory
-        from agentic_rag.config.settings import get_settings
-        settings = get_settings()
-        memory = ShortTermMemory(database_url=settings.database_url)
-        await memory.connect()
-        await memory.close()
-        components["database"] = "healthy"
+        agent = getattr(request.app.state, 'agent', None)
+        if agent and agent.short_term_memory:
+            # 复用已有的短期记忆连接
+            try:
+                session = agent.short_term_memory.async_session()
+                if session:
+                    components["database"] = "healthy"
+                else:
+                    components["database"] = "unhealthy"
+            except Exception:
+                components["database"] = "degraded"
+        else:
+            # Agent未初始化时才创建新连接检查
+            from agentic_rag.memory.short_term import ShortTermMemory
+            from agentic_rag.config.settings import get_settings
+            settings = get_settings()
+            memory = ShortTermMemory(database_url=settings.database_url)
+            await memory.connect()
+            await memory.close()
+            components["database"] = "healthy"
     except Exception as e:
         logger.warning("数据库健康检查失败: {}", str(e))
         components["database"] = "unhealthy"

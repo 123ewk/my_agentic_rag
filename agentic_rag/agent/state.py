@@ -37,16 +37,19 @@ class AgentState(TypedDict):
     confidence_level: Optional[str]           # 置信度等级: "high"/"medium"/"low"
     needs_web_search: bool                  # 是否需要触发网络搜索
     search_results: List[Document]           # 网络搜索结果
-    
+    crag_loop_count: int                    # CRAG循环计数器，防止无限循环
+
     # 工具调用
     tool_results: Dict[str, Any]            # 工具调用结果
     tool_calls: List[str]                    # 调用的工具列表
-    
+    tool_call_failed: bool                  # 工具调用是否失败（让generation节点感知）
+
     # 记忆
     memory_context: List[str]              # 记忆上下文
     conversation_history: List[Dict]        # 对话历史
-    
+
     # 元数据
     reflection_count: int                   # 反思次数
+    previous_evaluation: Optional[Dict[str, float]]  # 上一次评估结果，用于反思时对比
     error: Optional[str]                   # 错误信息
     metadata: Dict[str, Any]               # 其他元数据

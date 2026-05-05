@@ -49,13 +49,25 @@ def calculator(expression: str) -> str:
         计算结果
     """
     try:
-        # 安全检查：只允许数字和运算符
         import re
+        # 安全检查：只允许数字、基本运算符和括号（禁止**幂运算防止DoS）
         if not re.match(r'^[\d+\-*/().\s]+$', expression):
             return "错误：表达式包含无效字符"
         
+        # 禁止幂运算符，防止 **999999999 导致DoS
+        if '**' in expression:
+            return "错误：不支持幂运算"
+        
+        # 限制表达式长度
+        if len(expression) > 100:
+            return "错误：表达式过长"
+        
+        # 限制嵌套深度，防止递归炸弹
+        if expression.count('(') > 10:
+            return "错误：括号嵌套过深"
+        
         # 计算结果
-        result = eval(expression)
+        result = eval(expression, {"__builtins__": {}})
         return f"{expression} = {result}"
     
     except ZeroDivisionError:
@@ -73,26 +85,70 @@ def python_repl(code: str) -> str:
     Returns:
         代码执行结果
     """
-    import io # io:输入输出模块，用来创建一个内存缓冲区，存储 print 的内容
-    import sys # sys: Python 系统模块，用来接管程序的输出（print 打印的内容）
+    import io
+    import sys
+    
+    # 危险代码黑名单检测
+    dangerous_patterns = [
+        r'__\w+__',                          # 双下划线属性访问（如 __class__, __subclasses__）
+        r'import\s+',                        # import语句
+        r'from\s+\w+\s+import',              # from xxx import
+        r'exec\s*\(',                        # exec调用
+        r'eval\s*\(',                        # eval调用
+        r'compile\s*\(',                     # compile调用
+        r'open\s*\(',                        # 文件操作
+        r'os\.',                             # os模块
+        r'sys\.',                            # sys模块（除了被重定向的stdout）
+        r'subprocess',                       # 子进程
+        r'__import__',                       # 动态导入
+        r'globals\s*\(',                     # globals访问
+        r'locals\s*\(',                      # locals访问
+        r'getattr\s*\(',                     # getattr动态属性访问
+        r'setattr\s*\(',                     # setattr动态属性设置
+        r'delattr\s*\(',                     # delattr动态属性删除
+        r'type\s*\(',                        # type动态类型创建
+    ]
+    
+    import re
+    for pattern in dangerous_patterns:
+        if re.search(pattern, code):
+            return f"安全限制：代码包含禁止的操作模式 ({pattern})"
     
     try:
-        # 捕获输出
-        # sys.stdout 是 Python 默认的标准输出（所有 print() 都会打印到这里）
-        old_stdout = sys.stdout # 第一步：把原来的输出保存到 old_stdout（执行完要恢复，不然主程序没法打印）
-        sys.stdout = io.StringIO() # 第二步：把输出重定向到一个内存字符串流 io.StringIO()→ 意思是：接下来所有 print() 不会显示在控制台，而是存到这个缓冲区里！
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
         
-        # 执行代码（限制时间和资源）,安全执行代码（最关键）
-        # exec()：Python 内置函数，执行字符串格式的代码
-
-        exec(code, {"__builtins__": {}}) 
-        # {"__builtins__": {}}：沙箱核心！
-        # __builtins__ 是 Python 所有内置函数 / 功能的集合（print、open、os、import 都在这）
-        # 把它设为空字典 = 禁用所有 Python 内置功能 → 代码里不能用print之外的危险操作（比如读写文件、删数据、联网），非常安全
+        # 加固沙箱：限制可用内置函数
+        safe_builtins = {
+            'print': print,
+            'range': range,
+            'len': len,
+            'int': int,
+            'float': float,
+            'str': str,
+            'bool': bool,
+            'list': list,
+            'dict': dict,
+            'set': set,
+            'tuple': tuple,
+            'abs': abs,
+            'min': min,
+            'max': max,
+            'sum': sum,
+            'sorted': sorted,
+            'enumerate': enumerate,
+            'zip': zip,
+            'map': map,
+            'filter': filter,
+            'round': round,
+            'isinstance': isinstance,
+            'type': type,
+        }
         
-        # 获取输出
-        output = sys.stdout.getvalue() # getvalue()：从缓冲区里拿出所有被捕获的print内容
-        sys.stdout = old_stdout # 把 sys.stdout 恢复成原来的样子（避免影响主程序）
+        exec(code, {"__builtins__": safe_builtins})
+        
+        output = sys.stdout.getvalue()
+        sys.stdout = old_stdout
         
         if output:
             return output
@@ -100,8 +156,10 @@ def python_repl(code: str) -> str:
             return "代码执行完成，无输出"
     
     except SyntaxError as e:
+        sys.stdout = old_stdout
         return f"语法错误: {str(e)}"
     except Exception as e:
+        sys.stdout = old_stdout
         return f"执行错误: {str(e)}"
 
 

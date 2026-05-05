@@ -161,17 +161,17 @@ class QueryRewriter:
         self.decomposer = QueryDecomposer(llm)
 
     def rewrite(self, query: str, strategy: str = "expansion") -> List[str]:
-        """重写查询
-        
-        Args:
+        """重写查询（同步版本，strategy="all"时串行执行）
+
+        参数:
             query: 原始查询
             strategy: 重写策略
                 - expansion: 查询扩展
                 - hyde: HyDE
                 - decomposition: 查询分解
                 - all: 所有策略
-        
-        Returns:
+
+        返回:
             重写后的查询列表
         """
         if strategy == "expansion":
@@ -182,10 +182,44 @@ class QueryRewriter:
         elif strategy == "decomposition":
             return self.decomposer.decompose(query)
         elif strategy == "all":
-            # 综合多种策略
+            # 同步版本：串行执行
             queries = set()
             queries.update(self.expansion.expand(query))
             queries.update(self.decomposer.decompose(query))
+            return list(queries)
+        else:
+            return [query]
+
+    async def arewrite(self, query: str, strategy: str = "expansion") -> List[str]:
+        """重写查询（异步版本，优化I：strategy="all"时并行执行）
+
+        参数:
+            query: 原始查询
+            strategy: 重写策略
+
+        返回:
+            重写后的查询列表
+        """
+        if strategy == "expansion":
+            return self.expansion.expand(query)
+        elif strategy == "hyde":
+            hypo_doc = self.hyde.generate_hypothetical_doc(query)
+            return [query, hypo_doc]
+        elif strategy == "decomposition":
+            return self.decomposer.decompose(query)
+        elif strategy == "all":
+            # 优化I：expansion和decomposition并行执行
+            import asyncio
+            expansion_task = asyncio.get_running_loop().run_in_executor(
+                None, self.expansion.expand, query
+            )
+            decomposition_task = asyncio.get_running_loop().run_in_executor(
+                None, self.decomposer.decompose, query
+            )
+            expansion_results, decomposition_results = await asyncio.gather(
+                expansion_task, decomposition_task
+            )
+            queries = set(expansion_results) | set(decomposition_results)
             return list(queries)
         else:
             return [query]
