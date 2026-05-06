@@ -2,172 +2,157 @@
 
 ## 📖 项目简介
 
-Agentic RAG 是一个基于 LangChain/LangGraph 的智能知识库问答系统，支持：
+Agentic RAG 是一个基于 LangChain/LangGraph 的**四路径智能知识库问答系统**，具有自主决策能力的 Agent 系统：
 
-- **多格式文档处理**：PDF、Word、Excel、CSV、Markdown、TXT、网页等
-- **向量检索**：基于 Milvus 的向量数据库存储与检索
-- **Agent 智能问答**：支持反思、多轮对话、工具调用（DuckDuckGo 搜索、计算器）
-- **语义重排**：BGE 重排模型优化检索结果
-- **流式响应**：支持 SSE 流式输出
-- **长短记忆**：短期记忆（PostgreSQL）+ 长期记忆（PostgreSQL + pgvector）
-- **多级缓存**：意图缓存、生成缓存、LLM 调用缓存
-- **定时任务**：短期记忆过期清理、长期记忆自动归档
+- **RAG能力**：向量检索 + 查询改写 + 混合检索 + BGE重排
+- **Agent能力**：双模式执行（DAG/ReAct）+ 工具调用（DuckDuckGo搜索、计算器）
+- **记忆能力**：短期会话记忆（PostgreSQL）+ 长期价值记忆（pgvector）
+- **四路径执行**：超快速并行 → 快速流式 → 标准DAG → ReAct复杂推理
 
 ---
 
-## 🛠️ 环境配置
+## 🏗️ 系统架构
 
-### 1. 复制环境配置文件
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           API 网关层                                     │
+│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
+│   │  请求追踪   │  │  限流保护   │  │  API认证    │  │  CORS防护   │   │
+│   └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Agent 执行层 (四路径)                                │
+│                                                                           │
+│   ┌──────────────────────┐  ┌────────────────┐  ┌────────────────────┐  │
+│   │ 超快速并行路径        │  │  快速流式路径   │  │  DAG 模式          │  │
+│   │ ultra_fast_stream    │  │ fast_stream     │  │  (预定义路径)       │  │
+│   │ ParallelExecutor     │  │ 手动执行+流式   │  │  graph.astream     │  │
+│   │ 三路并行+真流式      │  │ 首token<3s     │  │  节点级流式         │  │
+│   │ 首token<2s           │  │                │  │                    │  │
+│   └──────────────────────┘  └────────────────┘  └────────────────────┘  │
+│                                                                           │
+│   ┌────────────────────┐                                                  │
+│   │  ReAct 模式        │  ← 复杂问题自动切换（score≥0.6）                  │
+│   │  (自主决策)        │                                                  │
+│   │  Observe→Think→Act │                                                  │
+│   │  token级流式       │                                                  │
+│   └────────────────────┘                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           工具执行层                                      │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐         │
+│   │ 向量检索 │  │ 网络搜索 │  │ 查询改写 │  │ 外部工具(DuckDuck │         │
+│   │ (内置)   │  │ (内置)   │  │ (内置)   │  │ Go,Calculator)   │         │
+│   └──────────┘  └──────────┘  └──────────┘  └──────────────────┘         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 四路径执行架构
+
+| 路径 | 入口方法 | 核心策略 | 首 Token 时间 |
+|------|---------|---------|-------------|
+| **超快速并行** | `ultra_fast_stream_invoke` | ParallelExecutor 三路并行 + 真流式 | **~2-3s** |
+| **快速流式** | `fast_stream_invoke` | 手动执行节点 + 真流式 | **~3-5s** |
+| **标准 DAG** | `stream_invoke` | graph.astream 节点级流式 | **~40s** |
+| **ReAct** | `stream_run` | Observe→Think→Act + 真流式（复杂问题自动切换） | **~5-15s** |
+
+### 模式自动切换
+
+- **默认模式**：`dag`（快速流式，响应优先）
+- **自动切换**：当问题复杂度 score ≥ 0.6 时，自动切换到 ReAct 模式
+- **触发特征**：多步骤推理、调试/排错、深度分析、算法设计、原因分析
+
+---
+
+## ⚡ 性能优化
+
+### 优化后时间线对比
+
+```
+【优化前 - stream_invoke】
+0s──────────────────────────────────────────────────────────40s
+[记忆][意图+改写][检索][重排][generation阻塞..............][eval][CRAG?][refl?]
+                                                            ↑ 用户等到这里
+
+【优化后 - fast_stream_invoke】
+0s──────────────────────────────────5s─────────────────────15s
+[记忆][意图+改写][检索][重排][首token!→token→token→token→...]
+                              ↑ 用户在这里就看到答案了!
+
+后台: [eval][记忆保存]  ← 不阻塞用户
+
+【终极优化 - ultra_fast_stream_invoke】
+0s────────────────────3s─────────────────────12s
+[意图+改写][Memory‖Retrieval‖WebSearch][Rerank][首token!→token→...]
+           ↑ 三路并行，不等待Memory      ↑ 用户在这里看到答案!
+```
+
+### 核心优化点
+
+| 优化项 | 效果 |
+|--------|------|
+| 真流式生成（llm.astream） | 首token从8-15s降至0.5s |
+| 后台异步评估 | 不阻塞用户感知 |
+| 移除CRAG阻塞 | 最坏情况节省20s |
+| ParallelExecutor三路并行 | Memory+Retrieval+WebSearch同时执行 |
+| 生成缓存 | 重复问题<0.5s响应 |
+
+---
+
+## 🚀 快速开始
+
+### 1. 环境配置
 
 ```bash
 cp .env.example .env
+# 编辑 .env 填入 API 密钥
 ```
 
-### 2. 填写必要的 API 密钥和配置
-
-编辑 `.env` 文件，填入以下配置：
-
-```env
-# ========== LLM 配置 ==========
-QWEN_API_KEY=你的通义千问API密钥
-QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-QWEN_MODEL=qwen3.5-plus
-
-# ========== 嵌入模型配置 ==========
-ZHIPUAI_API_KEY=你的智谱AI API密钥
-ZP_XIANG_LIANG_MODEL=Embedding-3
-
-# ========== 向量数据库配置 ==========
-MILVUS_HOST=localhost
-MILVUS_PORT=19530
-MILVUS_USER=root
-MILVUS_PASSWORD=milvus
-
-# ========== 数据库配置 ==========
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/postgres
-
-# ========== 应用配置 ==========
-API_PORT=8000
-
-# ========== API 认证密钥 ==========
-API_KEY=your_api_key_here
-```
-
-### 3. 安装依赖
+### 2. 安装依赖
 
 ```bash
 uv sync
 ```
 
-### 4. 启动依赖服务
-
-确保以下服务已启动：
-- **Milvus**：向量数据库（默认端口 19530）
-- **PostgreSQL**：记忆存储（默认端口 5433）
-
----
-
-## 🚀 启动服务
-
-### 方式一：直接运行
+### 3. 启动服务
 
 ```bash
 python main.py
 ```
 
-服务启动后：
-- API 地址：`http://localhost:8000`
-- API 文档：`http://localhost:8000/api/docs`
-
-### 方式二：后台运行
-
-```bash
-nohup python main.py > app.log 2>&1 &
-```
+服务启动后访问：`http://localhost:8000/api/docs`
 
 ---
 
-## 📚 如何存文档到向量库
+## 📚 功能特性
 
-### 通过 API 上传（推荐）
+### 多格式文档处理
+PDF、Word、Excel、CSV、Markdown、TXT、网页等
 
-**接口**：`POST /api/v1/upload`
+### 混合检索
+向量检索（0.6权重）+ BM25关键词检索（0.4权重）+ BGE重排
 
-**请求头**：
-```
-X-API-Key: your_api_key_here
-```
+### 四路径执行
+1. **超快速并行**：`ultra_fast_stream_invoke` - Memory+Retrieval+WebSearch三路并行
+2. **快速流式**：`fast_stream_invoke` - 绕过graph直接llm.astream()真流式
+3. **标准DAG**：`stream_invoke` - LangGraph节点级流式
+4. **ReAct**：`stream_run` - Observe→Think→Act自主决策循环
 
-**请求体**：multipart/form-data
+### 工具调用
+- DuckDuckGo 搜索
+- Calculator 计算器
+- Python REPL
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| files | File | ✅ | 上传的文件（支持多文件） |
-| chunk_size | int | ❌ | 分块大小，默认 500 字符 |
-| chunk_overlap | int | ❌ | 分块重叠，默认 50 字符 |
+### 记忆系统
+- **短期记忆**：PostgreSQL会话持久化，24h TTL，Token级上下文截断
+- **长期记忆**：pgvector向量存储，价值筛选+四类型分类+时间衰减
 
-**支持的文件格式**：
-- PDF (.pdf)
-- Word (.docx)
-- Markdown (.md)
-- 纯文本 (.txt)
-- Excel (.xlsx, .xls)
-- CSV (.csv)
-
-**示例（curl）**：
-```bash
-curl -X POST "http://localhost:8000/api/v1/upload" \
-  -H "X-API-Key: your_api_key_here" \
-  -F "files=@/path/to/your/document.pdf" \
-  -F "chunk_size=500" \
-  -F "chunk_overlap=50"
-```
-
-**示例（Python）**：
-```python
-import requests
-
-url = "http://localhost:8000/api/v1/upload"
-headers = {"X-API-Key": "your_api_key_here"}
-files = {"files": open("document.pdf", "rb")}
-data = {"chunk_size": 500, "chunk_overlap": 50}
-
-response = requests.post(url, headers=headers, files=files, data=data)
-print(response.json())
-```
-
-**响应示例**：
-```json
-{
-  "success": true,
-  "documents_processed": 1,
-  "chunks_created": 15,
-  "message": "成功处理 1 个文件，创建 15 个分块"
-}
-```
-
-### 通过代码上传
-
-```python
-from agentic_rag.vectorstore.milvus_client import MilvusClient
-from agentic_rag.document_processing.loaders import DocumentLoader
-from agentic_rag.document_processing.splitters import get_splitter
-
-# 初始化组件
-vectorstore = MilvusClient(collection_name="table_agentic_rag")
-
-# 加载文档
-loader = DocumentLoader()
-documents = loader.load("path/to/your/document.pdf")
-
-# 分块处理
-splitter = get_splitter("semantic", chunk_size=500, chunk_overlap=50)
-chunks = splitter.split_documents(documents)
-
-# 存入向量库
-vectorstore.from_documents(chunks)
-print(f"已存入 {len(chunks)} 个文档块")
-```
+### 流式响应
+SSE格式流式输出，支持逐token显示
 
 ---
 
@@ -177,36 +162,6 @@ print(f"已存入 {len(chunks)} 个文档块")
 
 **接口**：`POST /api/v1/query`
 
-**请求头**：
-```
-X-API-Key: your_api_key_here
-Content-Type: application/json
-```
-
-**请求体**：
-```json
-{
-  "question": "你的问题",
-  "session_id": "可选的会话ID",
-  "user_id": "可选的用户ID",
-  "use_tools": true,
-  "max_reflection": 2,
-  "temperature": 0.7
-}
-```
-
-**参数说明**：
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| question | string | ✅ | 用户问题（1-2000字符） |
-| session_id | string | 自动生成 | 会话ID，用于多轮对话 |
-| user_id | string | null | 用户ID，用于长期记忆 |
-| use_tools | bool | true | 是否启用工具（DuckDuckGo搜索等） |
-| max_reflection | int | 2 | Agent 反思次数（0-5） |
-| temperature | float | 0.7 | 生成随机性（0-2） |
-
-**示例（curl）**：
 ```bash
 curl -X POST "http://localhost:8000/api/v1/query" \
   -H "X-API-Key: your_api_key_here" \
@@ -214,45 +169,51 @@ curl -X POST "http://localhost:8000/api/v1/query" \
   -d '{"question": "什么是人工智能？"}'
 ```
 
-**示例（Python）**：
-```python
-import requests
+**请求参数**：
 
-url = "http://localhost:8000/api/v1/query"
-headers = {
-    "X-API-Key": "your_api_key_here",
-    "Content-Type": "application/json"
-}
-payload = {
-    "question": "什么是人工智能？",
-    "use_tools": True,
-    "max_reflection": 2
-}
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| question | string | ✅ | 用户问题（1-2000字符） |
+| session_id | string | 自动生成 | 会话ID，用于多轮对话 |
+| user_id | string | null | 用户ID，用于长期记忆 |
+| model_name | string | qwen3.5-plus | 模型名称（qwen/MiniMax/glm） |
+| use_tools | bool | true | 是否启用工具（DuckDuckGo搜索等） |
+| use_fast_path | bool | true | 快速流式模式（真流式输出+后台评估） |
+| max_reflection | int | 2 | 反思次数（0-5） |
+| temperature | float | 0.7 | 生成随机性（0-2） |
+| mode | string | dag | 执行模式：`dag`（默认）或 `react`（复杂推理） |
 
-response = requests.post(url, headers=headers, json=payload)
-result = response.json()
+**mode 参数说明**：
+- `dag`：默认模式，快速流式响应，适合简单/中等复杂度问题
+- `react`：ReAct模式，复杂推理场景自动切换，适合多步骤推理、调试、深度分析
 
-print("回答:", result["answer"])
-print("来源:", result["sources"])
-print("处理时间:", result["processing_time"], "秒")
-```
+**响应字段**：
+
+| 字段 | 说明 |
+|------|------|
+| answer | AI回答内容 |
+| sources | 来源文档列表 |
+| metrics | 评估指标（faithfulness、answer_relevancy等） |
+| session_id | 会话ID |
+| intent | 识别的意图类型 |
+| mode_used | 实际使用的执行模式（dag/react） |
+| mode_reason | 模式切换原因（自动切换时填充） |
+| tools_used | 使用的工具列表 |
+| reflection_count | 反思次数 |
+| processing_time | 处理时间（秒） |
 
 **响应示例**：
 ```json
 {
   "answer": "人工智能（Artificial Intelligence，AI）是...",
-  "sources": [
-    {
-      "content": "人工智能是计算机科学的一个分支...",
-      "metadata": {"source": "document.pdf", "page": 1},
-      "score": 0.95,
-      "source": "document.pdf"
-    }
-  ],
+  "sources": [...],
+  "metrics": {"faithfulness": 0.85, "answer_relevancy": 0.92},
   "session_id": "abc123",
-  "intent": "definition",
+  "intent": "factual",
+  "mode_used": "dag",
+  "mode_reason": null,
   "tools_used": [],
-  "reflection_count": 1,
+  "reflection_count": 0,
   "processing_time": 2.35
 }
 ```
@@ -261,36 +222,41 @@ print("处理时间:", result["processing_time"], "秒")
 
 **接口**：`POST /api/v1/query/stream`
 
-返回 SSE 格式的流式响应，实时显示生成过程。
+返回 SSE 格式的流式响应，支持实时显示生成过程。
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/query/stream" \
+  -H "X-API-Key: your_api_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "解释一下为什么会出现这个错误"}'
+```
+
+---
+
+## 📤 如何存文档
+
+### 通过 API 上传
+
+**接口**：`POST /api/v1/upload`
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/upload" \
+  -H "X-API-Key: your_api_key_here" \
+  -F "files=@/path/to/document.pdf" \
+  -F "chunk_size=500" \
+  -F "chunk_overlap=50"
+```
+
+**支持格式**：PDF、Word、Markdown、TXT、Excel、CSV
 
 ---
 
 ## 🔧 系统维护
 
-### 查看系统健康状态
+### 健康检查
 
 ```bash
 curl -X GET "http://localhost:8000/api/v1/health"
-```
-
-**响应示例**：
-```json
-{
-  "status": "healthy",
-  "version": "1.0.0",
-  "components": {
-    "database": "healthy",
-    "vectorstore": "healthy",
-    "agent": "healthy"
-  },
-  "uptime_seconds": 3600.5
-}
-```
-
-### 查看日志
-
-```bash
-tail -f app.log
 ```
 
 ---
@@ -299,22 +265,32 @@ tail -f app.log
 
 ```
 agentic_rag/
-├── agent/                  # Agent 核心（状态、节点、边、图）
-├── api/                    # API 接口（FastAPI 路由、数据模型）
-├── config/                 # 配置（设置、日志）
-├── db_sql/                 # 数据库 SQL 脚本
-├── document_processing/    # 文档处理（加载器、分块器）
-├── evaluation/             # 评估指标
-├── lock/                   # 分布式锁（Redis、PostgreSQL）
-├── memory/                 # 记忆系统（短期、长期、缓存）
-├── models/                 # 模型封装
-├── retrieval/              # 检索（混合搜索、重排、查询改写）
-├── schedulers/             # 定时任务调度器（短期/长期记忆清理）
-├── tools/                  # 工具（DuckDuckGo搜索、计算器）
-├── ui/                     # Streamlit 前端
-├── vectorstore/            # 向量存储（Milvus、嵌入模型）
-├── main.py                 # 主程序入口
-└── .env                    # 环境变量配置
+├── agent/                      # Agent 核心
+│   ├── graph.py               # 四路径执行入口
+│   ├── complexity_analyzer.py # 问题复杂度分析
+│   ├── react/                 # ReAct Agent
+│   │   └── react_agent.py
+│   └── nodes/                 # DAG节点
+├── api/                       # API 接口
+│   ├── routes.py             # 路由
+│   └── schemas.py            # 数据模型
+├── config/                    # 配置
+├── document_processing/       # 文档处理
+├── evaluation/                # 评估指标
+├── lock/                      # 分布式锁
+├── memory/                    # 记忆系统
+│   ├── gen_cache.py          # 生成缓存（双键写入）
+│   ├── short_term_memory.py
+│   └── long_term_memory.py
+├── models/                    # 模型封装
+├── retrieval/                 # 检索
+│   ├── hybrid_search.py      # 混合检索
+│   └── rerank.py             # BGE重排
+├── schedulers/               # 定时任务
+├── tools/                    # 工具
+├── vectorstore/              # 向量存储
+├── main.py                   # 主程序入口
+└── .env                      # 环境变量配置
 ```
 
 ---
@@ -324,13 +300,12 @@ agentic_rag/
 **Q: 上传文档失败？**
 - 检查 Milvus 服务是否正常运行
 - 检查 API Key 是否正确
-- 确认文件格式是否支持
 
 **Q: 查询返回空结果？**
 - 确认已上传相关文档
 - 尝试调整问题表述
-- 检查向量库是否已初始化
 
-**Q: 如何查看已上传的文档？**
-- 通过 `/api/v1/health` 查看向量库状态
-- 向量库 collection 信息会返回文档数量
+**Q: 如何选择执行模式？**
+- `mode=dag`（默认）：简单问题，响应优先
+- `mode=react`：复杂推理、调试、多步决策
+- 不指定mode时，系统根据问题复杂度自动选择
