@@ -45,13 +45,14 @@ class GenerationCache:
         self._hits = 0
         self._misses = 0
 
-    def _generate_key(self, question: str, intent: Optional[str] = None) -> str:
+    def _generate_key(self, question: str, intent: Optional[str] = None, session_id: Optional[str] = None) -> str:
         """
         生成缓存键
 
-        参数:
-            question: 用户问题
-            intent: 意图类型（可选）
+        设计原则：相同问题 + 相同意图 = 相同答案
+        - question: 问题文本（归一化后MD5）
+        - intent: 意图类型（同一意图下的改写查询应命中缓存）
+        - session_id: 可选，用于区分不同会话的相同问题
 
         返回:
             缓存键的哈希值
@@ -59,6 +60,7 @@ class GenerationCache:
         content = question.strip().lower()
         if intent:
             content += f"|{intent}"
+        # 注意：session_id 不加入缓存键，因为同一问题在不同session应有相同答案
         return hashlib.md5(content.encode('utf-8')).hexdigest()
 
     async def _get_from_redis(self, key: str) -> Optional[Dict]:
@@ -85,6 +87,10 @@ class GenerationCache:
         """
         获取缓存的生成结果
 
+        缓存查找顺序（优先返回最早命中的缓存）：
+        1. question + intent 作为键
+        2. question 作为键（intent=None 的老缓存兼容）
+
         参数:
             question: 用户问题
             intent: 意图类型
@@ -92,27 +98,39 @@ class GenerationCache:
         返回:
             包含答案和元数据的字典，如果没有缓存则返回None
         """
+        # 优先查找精确匹配（question + intent）
         key = self._generate_key(question, intent)
-
-        with self._lock:
-            if key not in self._cache:
-                self._misses += 1
-                return None
-
-            if time.time() - self._timestamps.get(key, 0) > self.ttl_seconds:
-                del self._cache[key]
-                del self._timestamps[key]
-                self._misses += 1
-                return None
-
+        if key in self._cache and self._is_valid(key):
             self._cache.move_to_end(key)
             self._hits += 1
-            logger.debug(f"生成缓存命中: {question[:30]}...")
+            logger.debug(f"生成缓存命中(精确): {question[:30]}...")
             return self._cache[key]
+
+        # 回退查找：question only（兼容老缓存或规则命中的意图）
+        key_question_only = self._generate_key(question, None)
+        if key_question_only in self._cache and self._is_valid(key_question_only):
+            self._cache.move_to_end(key_question_only)
+            self._hits += 1
+            logger.debug(f"生成缓存命中(回退): {question[:30]}...")
+            return self._cache[key_question_only]
+
+        self._misses += 1
+        return None
+
+    def _is_valid(self, key: str) -> bool:
+        """检查缓存是否有效（未过期）"""
+        if key not in self._timestamps:
+            return False
+        return time.time() - self._timestamps.get(key, 0) <= self.ttl_seconds
 
     def set(self, question: str, response: str, intent: Optional[str] = None, metadata: Optional[Dict] = None):
         """
         设置缓存
+
+        优化策略：
+        - 同一问题在不同意图下产生不同答案，但缓存键不包含 session_id
+        - 缓存写入时会同时用 (question, intent) 和 (question, None) 两种键，
+          以提高回退查找时的命中率
 
         参数:
             question: 用户问题
@@ -120,25 +138,38 @@ class GenerationCache:
             intent: 意图类型
             metadata: 其他元数据（如检索文档摘要等）
         """
-        key = self._generate_key(question, intent)
+        # 同时用两种键写入，确保回退查找能命中
+        keys_to_write = []
+        if intent:
+            keys_to_write.append(self._generate_key(question, intent))
+        # 也写入 question only 的键（兼容老缓存）
+        keys_to_write.append(self._generate_key(question, None))
 
         with self._lock:
-            if len(self._cache) >= self.max_size and key not in self._cache:
-                oldest_key = next(iter(self._cache))
-                del self._cache[oldest_key]
-                del self._timestamps[oldest_key]
+            # LRU淘汰：如果缓存满了且要写入新键，删除最老的
+            if len(self._cache) >= self.max_size:
+                # 检查要写入的键是否已存在
+                existing_keys = set(k for k in keys_to_write if k in self._cache)
+                if not existing_keys:
+                    # 需要淘汰：删除最老的键
+                    oldest_key = next(iter(self._cache))
+                    del self._cache[oldest_key]
+                    del self._timestamps[oldest_key]
+                    logger.debug(f"缓存淘汰(空间不足): {oldest_key[:16]}...")
 
-            self._cache[key] = {
-                "question": question,
-                "response": response,
-                "intent": intent,
-                "metadata": metadata or {},
-                "created_at": time.time()
-            }
-            self._timestamps[key] = time.time()
-            self._cache.move_to_end(key)
+            # 写入所有键（相同数据）
+            for key in keys_to_write:
+                self._cache[key] = {
+                    "question": question,
+                    "response": response,
+                    "intent": intent,
+                    "metadata": metadata or {},
+                    "created_at": time.time()
+                }
+                self._timestamps[key] = time.time()
+                self._cache.move_to_end(key)
 
-            logger.debug(f"生成缓存已保存: {question[:30]}...")
+            logger.debug(f"生成缓存已保存: {question[:30]}... (写入{len(keys_to_write)}个键)")
 
     async def get_async(self, question: str, intent: Optional[str] = None) -> Optional[Dict]:
         """异步获取缓存，优先查内存，再查Redis"""

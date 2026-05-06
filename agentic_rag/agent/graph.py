@@ -547,9 +547,10 @@ class AgenticRAGGraph:
         if memory_tasks:
             await asyncio.gather(*memory_tasks)
 
-        # 生成缓存快速路径检查（仅用question作为键，与写入时保持一致）
+        # 生成缓存快速路径检查（优化：精确匹配+回退兼容）
         if settings.generation_cache_enabled:
-            cached_gen = self.gen_cache.get(question, None)
+            # 先尝试精确匹配 (question + intent)，回退到 (question, None) 兼容老缓存
+            cached_gen = self.gen_cache.get(question, intent) or self.gen_cache.get(question, None)
             if cached_gen:
                 cached_response = cached_gen.get("response", "")
                 logger.info(f"生成缓存命中（快速路径）: {question[:50]}...")
@@ -923,9 +924,13 @@ class AgenticRAGGraph:
             "data": {"stage": "intent_classification", "intent": intent}
         }
 
-        # 缓存二次检查（基于意图）
+        # 优化缓存检查：意图识别完成后，用 (question, intent) 精确查找缓存
         if settings.generation_cache_enabled:
+            # 先尝试精确匹配 (question + intent)
             cached_gen = self.gen_cache.get(question, intent)
+            if not cached_gen:
+                # 回退到 (question, None) 兼容老缓存
+                cached_gen = self.gen_cache.get(question, None)
             if cached_gen:
                 cached_response = cached_gen.get("response", "")
                 logger.info(f"快速流式-生成缓存命中(意图过滤): {question[:50]}...")

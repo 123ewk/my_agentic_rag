@@ -86,6 +86,8 @@ class QueryResponse(BaseModel):
     metrics: Dict[str, float] = Field(default_factory=dict, description="评估指标")
     session_id: str = Field(..., description="会话ID")
     intent: str = Field(..., description="识别的意图")
+    mode_used: str = Field(..., description="实际使用的执行模式（dag/react）")
+    mode_reason: Optional[str] = Field(None, description="模式切换原因（自动切换时填充）")
     tools_used: List[str] = Field(default_factory=list, description="使用的工具")
     reflection_count: int = Field(0, description="反思次数")
     processing_time: float = Field(..., description="处理时间（秒）")

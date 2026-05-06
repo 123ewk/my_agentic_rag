@@ -599,15 +599,20 @@ async def query(
         
         # 生成session_id
         session_id = request.session_id or str(uuid.uuid4())
-        
+
+        # 记录实际使用的模式和原因（用于响应）
+        actual_mode_used = "dag"
+        mode_switch_reason = None
+
         # 如果指定了模型名称，动态更新 agent 的 LLM（加锁防止并发竞态）
         if request.model_name:
             with _llm_lock:
                 llm = get_llm_for_model(request.model_name)
                 agent.llm = llm
             logger.info(f"[{request_id}] 已切换到模型: {request.model_name}")
-        
+
         # 如果指定了Agent模式，动态切换（仅当请求的mode与当前不同时才重建）
+        # 如果未指定mode，自动分析问题复杂度决定使用哪种模式
         if request.mode:
             from agentic_rag.config.settings import get_settings as _get_settings
             _settings = _get_settings()
@@ -631,6 +636,36 @@ async def query(
                     agent._react_agent = None
                     agent.graph = agent._build_graph()
                     logger.info(f"[{request_id}] 动态切换到DAG模式")
+            actual_mode_used = "react" if target_react else "dag"
+        else:
+            # 自动复杂度分析：未指定mode时，根据问题复杂度自动选择
+            from agentic_rag.agent.complexity_analyzer import analyze_question_complexity
+            recommended_mode, complexity_detail = analyze_question_complexity(request.question)
+
+            if recommended_mode == "react" and not agent.use_react:
+                # 复杂问题切换到ReAct模式
+                from agentic_rag.agent.react import ReActAgent
+                agent.use_react = True
+                agent._react_agent = ReActAgent(
+                    llm=agent.llm,
+                    embeddings=agent.embeddings,
+                    vectorstore=agent.vectorstore,
+                    reranker=agent.reranker,
+                    tools=agent.tools,
+                    prompt_template=agent.prompt_template,
+                    short_term_memory=agent.short_term_memory,
+                    long_term_memory=agent.long_term_memory,
+                )
+                actual_mode_used = "react"
+                # 构建原因说明
+                reasons = []
+                for category in complexity_detail.get("react_matches", {}):
+                    reasons.append(f"涉及{category}特征")
+                mode_switch_reason = " + ".join(reasons) if reasons else "多步推理/复杂分析"
+                logger.info(
+                    f"[{request_id}] 问题复杂度较高(score={complexity_detail['final_score']:.2f})，"
+                    f"自动切换到ReAct模式，原因: {mode_switch_reason}"
+                )
         
         # 记录调用参数
         logger.info(f"[{request_id}] 开始处理查询: question='{request.question[:50]}...', session_id={session_id}")
@@ -680,6 +715,8 @@ async def query(
             metrics=result.get("evaluation", {}),
             session_id=session_id,
             intent=result.get("intent", "unknown"),
+            mode_used=actual_mode_used,
+            mode_reason=mode_switch_reason,
             tools_used=list(tool_results.keys()),
             reflection_count=result.get("reflection_count", 0),
             processing_time=processing_time

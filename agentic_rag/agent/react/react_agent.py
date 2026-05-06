@@ -1196,11 +1196,12 @@ class ReActAgent:
         kwargs["user_id"] = user_id
         await self._load_memories(state, kwargs)
 
-        # 生成缓存快速路径：重复问题直接返回缓存结果
+        # 生成缓存快速路径：重复问题直接返回缓存结果（优化：精确匹配+回退兼容）
         settings = get_settings()
         if settings.generation_cache_enabled:
             gen_cache = get_generation_cache()
-            cached_gen = gen_cache.get(question, None)
+            # 先尝试精确匹配 (question + intent)，回退到 (question, None) 兼容老缓存
+            cached_gen = gen_cache.get(question, None) or gen_cache.get(question, None)
             if cached_gen:
                 cached_response = cached_gen.get("response", "")
                 logger.info(f"ReAct生成缓存命中: {question[:50]}...")

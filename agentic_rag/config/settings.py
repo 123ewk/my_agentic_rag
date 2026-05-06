@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     crag_confidence_threshold_low: float = 0.3  # 低置信度阈值(<此值触发网络搜索)
 
     # Agent模式配置
-    agent_mode: str = "react"  # Agent执行模式: "react"(ReAct Agent) 或 "dag"(传统DAG工作流)
+    agent_mode: str = "dag"  # Agent执行模式: "dag"(快速流式,默认) 或 "react"(复杂推理) - 已优化为默认dag以提升响应速度
 
     # 快速流式配置（响应速度优化）
     fast_stream_enabled: bool = True  # 是否启用快速流式模式（DAG模式下use_fast_path=True时生效）
