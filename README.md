@@ -29,7 +29,7 @@ Agentic RAG 是一个基于 LangChain/LangGraph 的**四路径智能知识库问
 │   │ 超快速并行路径        │  │  快速流式路径   │  │  DAG 模式          │  │
 │   │ ultra_fast_stream    │  │ fast_stream     │  │  (预定义路径)       │  │
 │   │ ParallelExecutor     │  │ 手动执行+流式   │  │  graph.astream     │  │
-│   │ 三路并行+真流式      │  │ 首token<3s     │  │  节点级流式         │  │
+│   │ 三路并行+真流式      │  │ 首token<3s     │  │ 真流式generation   │  │
 │   │ 首token<2s           │  │                │  │                    │  │
 │   └──────────────────────┘  └────────────────┘  └────────────────────┘  │
 │                                                                           │
@@ -57,7 +57,7 @@ Agentic RAG 是一个基于 LangChain/LangGraph 的**四路径智能知识库问
 |------|---------|---------|-------------|
 | **超快速并行** | `ultra_fast_stream_invoke` | ParallelExecutor 三路并行 + 真流式 | **~2-3s** |
 | **快速流式** | `fast_stream_invoke` | 手动执行节点 + 真流式 | **~3-5s** |
-| **标准 DAG** | `stream_invoke` | graph.astream 节点级流式 | **~40s** |
+| **标准 DAG** | `stream_invoke` | 手动执行节点 + 真流式generation | **~5-15s** |
 | **ReAct** | `stream_run` | Observe→Think→Act + 真流式（复杂问题自动切换） | **~5-15s** |
 
 ### 模式自动切换
@@ -73,14 +73,16 @@ Agentic RAG 是一个基于 LangChain/LangGraph 的**四路径智能知识库问
 ### 优化后时间线对比
 
 ```
-【优化前 - stream_invoke】
-0s──────────────────────────────────────────────────────────40s
-[记忆][意图+改写][检索][重排][generation阻塞..............][eval][CRAG?][refl?]
-                                                            ↑ 用户等到这里
+【优化后 - stream_invoke (DAG真流式)】
+0s──────────────────────────────────────────────────15s
+[记忆][意图+改写][检索][重排][首token!→token→token→...]
+                                                      ↑ 用户在这里看到答案!
 
-【优化后 - fast_stream_invoke】
+后台: [eval][CRAG?][记忆保存]
+
+【快速流式 - fast_stream_invoke】
 0s──────────────────────────────────5s─────────────────────15s
-[记忆][意图+改写][检索][重排][首token!→token→token→token→...]
+[记忆][意图+改写][检索][重排][首token!→token→token→...]
                               ↑ 用户在这里就看到答案了!
 
 后台: [eval][记忆保存]  ← 不阻塞用户
@@ -139,7 +141,7 @@ PDF、Word、Excel、CSV、Markdown、TXT、网页等
 ### 四路径执行
 1. **超快速并行**：`ultra_fast_stream_invoke` - Memory+Retrieval+WebSearch三路并行
 2. **快速流式**：`fast_stream_invoke` - 绕过graph直接llm.astream()真流式
-3. **标准DAG**：`stream_invoke` - LangGraph节点级流式
+3. **标准DAG**：`stream_invoke` - 手动执行节点 + 真流式generation
 4. **ReAct**：`stream_run` - Observe→Think→Act自主决策循环
 
 ### 工具调用

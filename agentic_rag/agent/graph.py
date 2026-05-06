@@ -509,18 +509,16 @@ class AgenticRAGGraph:
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         流式执行Agent（优化E：DAG模式支持真流式generation）
-        
-        ReAct模式下使用ReActAgent的stream_run（真正的token级流式），
-        DAG模式下使用graph.astream() + generation_node_stream（真流式替代伪流式）
-        
+
+        架构说明：
+        - 使用 graph.astream() 执行前置节点（intent、retrieval、rerank等）
+        - 到达generation时，手动用llm.astream()进行真token级流式输出
+        - evaluation/reflection等后续节点通过直接调用执行
+
         产出：
             Dict[str, Any]: 流式事件，包含type和content字段
-                - type="thought": Agent的观察结果（ReAct模式独有）
-                - type="action": Agent选择的行动（ReAct模式独有）
-                - type="observation": 行动执行结果（ReAct模式独有）
                 - type="status": 状态更新
-                - type="token": 生成内容的token级流式（ReAct模式独有）
-                - type="chunk": 生成的内容块（DAG模式）
+                - type="token": token级真流式输出
                 - type="sources": 检索到的文档
                 - type="metrics": 评估指标
                 - type="done": 完成信号
@@ -534,42 +532,49 @@ class AgenticRAGGraph:
             ):
                 yield event
             return
-        
+
         settings = get_settings()
         initial_state = self._create_initial_state(question, kwargs)
-        
-        # 优化G：记忆并行加载
+        state = initial_state.copy()
+
+        # ===== 阶段1: 并行加载记忆 =====
         memory_tasks = []
         if self.short_term_memory and session_id:
-            memory_tasks.append(self._load_short_term_memory_stream(initial_state, session_id))
+            memory_tasks.append(self._load_short_term_memory_stream(state, session_id))
         if self.long_term_memory and user_id:
-            memory_tasks.append(self._search_long_term_memory_stream(initial_state, user_id, question))
+            memory_tasks.append(self._search_long_term_memory_stream(state, user_id, question))
         if memory_tasks:
             await asyncio.gather(*memory_tasks)
 
-        # 生成缓存快速路径检查（优化：精确匹配+回退兼容）
+        # ===== 阶段2: 意图识别 + 查询改写（合并节点）=====
+        yield {
+            "type": "status",
+            "content": "正在分析问题意图...",
+            "data": {"stage": "intent_classification"}
+        }
+        intent_result = intent_and_rewrite_node(state, self.llm, self.intent_cache)
+        state.update(intent_result)
+        intent = state.get("intent", "factual")
+
+        # 生成缓存检查
         if settings.generation_cache_enabled:
-            # 先尝试精确匹配 (question + intent)，回退到 (question, None) 兼容老缓存
             cached_gen = self.gen_cache.get(question, intent) or self.gen_cache.get(question, None)
             if cached_gen:
                 cached_response = cached_gen.get("response", "")
-                logger.info(f"生成缓存命中（快速路径）: {question[:50]}...")
-
+                logger.info(f"生成缓存命中: {question[:50]}...")
                 for i in range(0, len(cached_response), 50):
                     chunk = cached_response[i:i+50]
                     if chunk:
                         yield {
-                            "type": "chunk",
+                            "type": "token",
                             "content": chunk,
                             "data": {"partial_response": cached_response[:i+len(chunk)], "cached": True}
                         }
                         await asyncio.sleep(0.05)
-
                 await self._save_memories(
                     {"generation": cached_response, "intent": cached_gen.get("intent", "unknown")},
                     question, session_id, user_id
                 )
-
                 yield {
                     "type": "done",
                     "content": "回答生成完成(缓存)",
@@ -584,193 +589,212 @@ class AgenticRAGGraph:
                 }
                 return
 
-        state = initial_state.copy()
-        think_content = []
-        generation_streamed = False
-        
-        # 使用 graph.astream() 执行图，获取节点状态更新
-        async for chunk in self.graph.astream(state, stream_mode="updates"):
-            for node_name, node_state in chunk.items():
-                if not node_state:
-                    continue
-                    
-                state.update(node_state)
-                
-                if node_name == "intent_and_rewrite":
-                    intent = node_state.get("intent", "")
-                    
-                    yield {
-                        "type": "status",
-                        "content": "正在分析问题意图...",
-                        "data": {"stage": "intent_classification", "intent": intent}
-                    }
-                    
-                    # 生成缓存检查（基于意图的二次检查）
-                    if settings.generation_cache_enabled:
-                        cached_gen = self.gen_cache.get(question, intent)
-                        if cached_gen:
-                            cached_response = cached_gen.get("response", "")
-                            logger.info(f"生成缓存命中（意图过滤）: {question[:50]}...")
+        # ===== 阶段3: 根据意图执行不同路径 =====
+        if intent == "tool_call":
+            yield {
+                "type": "status",
+                "content": "正在调用工具...",
+                "data": {"stage": "tool_call"}
+            }
+            tool_result = tool_call_node(state, self.llm, self.tools)
+            state.update(tool_result)
 
-                            for i in range(0, len(cached_response), 50):
-                                chunk_text = cached_response[i:i+50]
-                                if chunk_text:
-                                    yield {
-                                        "type": "chunk",
-                                        "content": chunk_text,
-                                        "data": {"partial_response": cached_response[:i+len(chunk_text)], "cached": True}
-                                    }
-                                    await asyncio.sleep(0.05)
+        elif intent in ("factual", "multi_hop", "reasoning"):
+            # 检索路径
+            yield {
+                "type": "status",
+                "content": "正在检索相关文档...",
+                "data": {"stage": "retrieval"}
+            }
+            retrieval_result = parallel_retrieval_node(state, self.vectorstore)
+            state.update(retrieval_result)
 
-                            await self._save_memories(
-                                {"generation": cached_response, "intent": intent},
-                                question, session_id, user_id
-                            )
+            yield {
+                "type": "status",
+                "content": "正在优化文档排序...",
+                "data": {"stage": "rerank"}
+            }
+            rerank_result = rerank_node(state, self.reranker)
+            state.update(rerank_result)
 
-                            yield {
-                                "type": "done",
-                                "content": "回答生成完成(缓存)",
-                                "data": {
-                                    "session_id": session_id,
-                                    "user_id": user_id,
-                                    "cached": True,
-                                    "intent": intent,
-                                    "reflection_count": 0,
-                                    "gen_cache_hit": True
-                                }
-                            }
-                            return
+            if state.get("reranked_docs"):
+                docs_info = [
+                    {
+                        "content": doc.page_content[:200] + "...",
+                        "metadata": doc.metadata,
+                        "score": doc.metadata.get("score")
+                    }
+                    for doc in state["reranked_docs"][:3]
+                ]
+                yield {
+                    "type": "sources",
+                    "content": "检索到相关文档",
+                    "data": {"documents": docs_info}
+                }
 
-                elif node_name == "intent_classification":
-                    intent = node_state.get("intent", "")
-                    yield {
-                        "type": "status",
-                        "content": "正在分析问题意图...",
-                        "data": {"stage": "intent_classification", "intent": intent}
-                    }
-                    
-                elif node_name == "query_rewrite":
-                    yield {
-                        "type": "status",
-                        "content": "正在改写查询...",
-                        "data": {"stage": "query_rewrite", "queries": node_state.get("rewritten_queries", [])}
-                    }
-                    
-                elif node_name == "retrieval":
-                    yield {
-                        "type": "status",
-                        "content": "正在检索相关文档...",
-                        "data": {"stage": "retrieval", "doc_count": len(state.get("retrieved_docs", []))}
-                    }
-                    
-                elif node_name == "rerank":
-                    yield {
-                        "type": "status",
-                        "content": "正在优化文档排序...",
-                        "data": {"stage": "rerank"}
-                    }
-                    
-                    if state.get("reranked_docs"):
-                        docs_info = [
-                            {
-                                "content": doc.page_content[:200] + "...",
-                                "metadata": doc.metadata,
-                                "score": doc.metadata.get("score")
-                            }
-                            for doc in state["reranked_docs"][:3]
-                        ]
+        # summary意图直接跳到生成
+
+        # ===== 阶段4: 真流式生成（核心优化！使用llm.astream替代伪流式）=====
+        yield {
+            "type": "status",
+            "content": "正在生成回答...",
+            "data": {"stage": "generation"}
+        }
+
+        context_parts = _build_context_parts(
+            state.get("memory_context", []),
+            state.get("conversation_history", []),
+            state.get("reranked_docs", []),
+            state.get("search_results", []),
+            state.get("tool_results", {}),
+            state.get("tool_call_failed", False),
+            settings
+        )
+        context = "\n".join(context_parts) if context_parts else "(无相关上下文)"
+        prompt = self.prompt_template.format(context=context, question=question)
+
+        full_text = []
+        async for chunk in self.llm.astream(prompt):
+            token = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            if token:
+                full_text.append(token)
+                yield {
+                    "type": "token",
+                    "content": token,
+                    "data": {"partial_response": "".join(full_text)}
+                }
+
+        generation = "".join(full_text)
+        generation = _clean_think_tags(generation)
+        state["generation"] = generation
+
+        # 写入生成缓存
+        if settings.generation_cache_enabled:
+            self.gen_cache.set(
+                question,
+                generation,
+                intent=None,
+                metadata={"cached_at": time.time(), "actual_intent": state.get("intent")}
+            )
+
+        # ===== 阶段5: 评估（轻量级，不阻塞）=====
+        yield {
+            "type": "status",
+            "content": "正在评估回答质量...",
+            "data": {"stage": "evaluation"}
+        }
+        eval_result = evaluation_node(state, self.llm)
+        state.update(eval_result)
+
+        if state.get("evaluation"):
+            yield {
+                "type": "metrics",
+                "content": "评估完成",
+                "data": state["evaluation"]
+            }
+
+        confidence_level = state.get("confidence_level", "high")
+        overall_score = state.get("evaluation", {}).get("overall_score", 0.5)
+
+        # CRAG低置信度处理
+        crag_triggered = False
+        if settings.crag_enabled and confidence_level == "low":
+            crag_loop_count = state.get("crag_loop_count", 0)
+            if crag_loop_count < 3:  # MAX_CRAG_LOOPS
+                crag_triggered = True
+                yield {
+                    "type": "status",
+                    "content": "置信度较低，正在搜索网络信息...",
+                    "data": {"stage": "crag_web_search"}
+                }
+                web_search_result = web_search_node(state, self.llm)
+                state.update(web_search_result)
+
+                # 重新生成
+                yield {
+                    "type": "status",
+                    "content": "正在基于搜索结果重新生成...",
+                    "data": {"stage": "regeneration"}
+                }
+                context_parts = _build_context_parts(
+                    state.get("memory_context", []),
+                    state.get("conversation_history", []),
+                    state.get("reranked_docs", []),
+                    state.get("search_results", []),
+                    state.get("tool_results", {}),
+                    state.get("tool_call_failed", False),
+                    settings
+                )
+                context = "\n".join(context_parts) if context_parts else "(无相关上下文)"
+                prompt = self.prompt_template.format(context=context, question=question)
+
+                full_text = []
+                async for chunk in self.llm.astream(prompt):
+                    token = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                    if token:
+                        full_text.append(token)
                         yield {
-                            "type": "sources",
-                            "content": "检索到相关文档",
-                            "data": {"documents": docs_info}
+                            "type": "token",
+                            "content": token,
+                            "data": {"partial_response": "".join(full_text), "regenerated": True}
                         }
-                    
-                elif node_name == "tool_call":
+
+                generation = "".join(full_text)
+                generation = _clean_think_tags(generation)
+                state["generation"] = generation
+
+        # ===== 阶段6: 反思（如需要）=====
+        reflection_count = state.get("reflection_count", 0)
+        max_reflection = kwargs.get("max_reflection", 2)
+        if state.get("needs_reflection", False) and reflection_count < max_reflection:
+            yield {
+                "type": "status",
+                "content": "正在进行反思优化...",
+                "data": {"stage": "reflection", "reflection_count": reflection_count}
+            }
+            reflection_result = reflection_node(state, self.llm)
+            state.update(reflection_result)
+
+            # 反思后重新生成
+            yield {
+                "type": "status",
+                "content": "正在基于反思重新生成...",
+                "data": {"stage": "regeneration"}
+            }
+            context_parts = _build_context_parts(
+                state.get("memory_context", []),
+                state.get("conversation_history", []),
+                state.get("reranked_docs", []),
+                state.get("search_results", []),
+                state.get("tool_results", {}),
+                state.get("tool_call_failed", False),
+                settings
+            )
+            context = "\n".join(context_parts) if context_parts else "(无相关上下文)"
+            prompt = self.prompt_template.format(context=context, question=question)
+
+            full_text = []
+            async for chunk in self.llm.astream(prompt):
+                token = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if token:
+                    full_text.append(token)
                     yield {
-                        "type": "status",
-                        "content": "正在调用工具...",
-                        "data": {"stage": "tool_call", "tools": node_state.get("tool_calls", [])}
-                    }
-                    
-                elif node_name == "generation":
-                    yield {
-                        "type": "status",
-                        "content": "正在生成回答...",
-                        "data": {"stage": "generation"}
-                    }
-                    
-                    # 优化E：使用真流式输出替代伪流式
-                    # 原逻辑：llm.invoke()获取完整文本后分段yield模拟流式
-                    # 优化后：generation_node已通过llm.invoke()生成完整文本，
-                    # 这里直接分段输出（因为graph.astream是节点级流式，无法在节点内用llm.astream）
-                    generation_text = state.get("generation", "")
-                    if generation_text:
-                        cleaned_text = _clean_think_tags(generation_text)
-                        
-                        for i in range(0, len(cleaned_text), 50):
-                            segment = cleaned_text[i:i+50]
-                            yield {
-                                "type": "chunk",
-                                "content": segment,
-                                "data": {
-                                    "partial_response": cleaned_text[:i+len(segment)],
-                                    "has_think": "<think" in generation_text
-                                }
-                            }
-                            await asyncio.sleep(0.02)
-                        
-                        think_pattern = r'<think\b[^>]*>(.*?)</think\s*>'
-                        think_matches = re.findall(think_pattern, generation_text, re.DOTALL)
-                        think_content = [match.strip() for match in think_matches if match.strip()]
-                        
-                        self.gen_cache.set(
-                            question,
-                            cleaned_text,
-                            intent=None,
-                            metadata={"cached_at": time.time(), "actual_intent": state.get("intent")}
-                        )
-                    
-                elif node_name == "evaluation":
-                    yield {
-                        "type": "status",
-                        "content": "正在评估回答质量...",
-                        "data": {"stage": "evaluation"}
-                    }
-                    
-                    if state.get("evaluation"):
-                        yield {
-                            "type": "metrics",
-                            "content": "评估完成",
-                            "data": state["evaluation"]
-                        }
-                    
-                    if settings.crag_enabled:
-                        confidence_level = state.get("confidence_level", "medium")
-                        overall_score = state.get("evaluation", {}).get("overall_score", 0.5)
-                        logger.info(f"CRAG路由: confidence={confidence_level}, score={overall_score:.3f}")
-                
-                elif node_name == "web_search":
-                    yield {
-                        "type": "status",
-                        "content": "置信度较低，正在搜索网络信息...",
-                        "data": {
-                            "stage": "crag_web_search",
-                            "confidence_level": state.get("confidence_level"),
-                            "overall_score": state.get("evaluation", {}).get("overall_score")
-                        }
-                    }
-                    
-                elif node_name == "reflection":
-                    yield {
-                        "type": "status",
-                        "content": "正在进行反思优化...",
-                        "data": {"stage": "reflection", "reflection_count": state.get("reflection_count", 0)}
+                        "type": "token",
+                        "content": token,
+                        "data": {"partial_response": "".join(full_text), "regenerated": True}
                     }
 
-        # 保存对话记忆
+            generation = "".join(full_text)
+            generation = _clean_think_tags(generation)
+            state["generation"] = generation
+
+        # ===== 阶段7: 保存记忆 + 完成 =====
         await self._save_memories(state, question, session_id, user_id)
-        
-        # 完成
+
+        think_pattern = r'<think\b[^>]*>(.*?)</think\s*>'
+        think_matches = re.findall(think_pattern, "".join(full_text), re.DOTALL)
+        think_content = [match.strip() for match in think_matches if match.strip()]
+
         yield {
             "type": "done",
             "content": "回答生成完成",
@@ -785,7 +809,7 @@ class AgenticRAGGraph:
                 "confidence_score": state.get("confidence_score"),
                 "confidence_level": state.get("confidence_level"),
                 "overall_score": state.get("evaluation", {}).get("overall_score"),
-                "crag_triggered": state.get("needs_web_search", False)
+                "crag_triggered": crag_triggered
             }
         }
 
