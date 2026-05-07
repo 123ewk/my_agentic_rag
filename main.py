@@ -2,13 +2,22 @@
 Agentic RAG主程序
 """
 from pathlib import Path
+import os
 from dotenv import load_dotenv
+
+# LangSmith tracing 配置（在任何 langchain 模块导入之前设置环境变量）
+load_dotenv()
+_langsmit_tracing = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
+if _langsmit_tracing:
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ.setdefault("LANGSMITH_PROJECT", os.getenv("LANGSMITH_PROJECT", "agentic_rag-dev"))
+    os.environ.setdefault("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+
 import asyncio
 import signal
 import sys
 import atexit
 
-from agentic_rag.config.settings import get_settings
 from agentic_rag.config.logger_config import setup_logging
 from agentic_rag.vectorstore.milvus_client import get_vectorstore
 from agentic_rag.vectorstore.embeddings import get_embeddings

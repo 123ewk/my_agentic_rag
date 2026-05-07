@@ -19,6 +19,7 @@ dependencies = [
     "langchain_text_splitters>=1.1.1",
     "langgraph>=1.1.6",
     "langgraph-checkpoint-postgres>=3.0.5",
+    "langsmith>=0.1.0",
     "loguru>=0.7.3",
     "numpy>=2.4.4", # 最基础、最重要的数值计算库
     "nvidia-ml-py>=13.595.45", # 用于获取GPU信息
